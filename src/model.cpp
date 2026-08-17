@@ -44,20 +44,57 @@ static double kv_float(const gguf_context * ctx, const char * key) {
     }
 }
 
+static std::string kv_string(const gguf_context * ctx, const char * key) {
+    int64_t id = kv_find(ctx, key);
+    if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_STRING) {
+        fprintf(stderr, "error: key '%s' is not a string type\n", key);
+        exit(1);
+    }
+    return gguf_get_val_str(ctx, id);
+}
+
 hparams load_hparams(const gguf_context * ctx) {
     hparams h{};
-    h.n_embd          = kv_int(ctx, "phi3.embedding_length");
-    h.n_head          = kv_int(ctx, "phi3.attention.head_count");
-    h.n_head_kv       = kv_int(ctx, "phi3.attention.head_count_kv");
-    h.n_layer         = kv_int(ctx, "phi3.block_count");
-    h.n_ff            = kv_int(ctx, "phi3.feed_forward_length");
-    h.n_rot           = kv_int(ctx, "phi3.rope.dimension_count");
-    h.n_ctx_orig      = kv_int(ctx, "phi3.rope.scaling.original_context_length");
-    h.rms_eps         = (float) kv_float(ctx, "phi3.attention.layer_norm_rms_epsilon");
-    h.rope_freq_base  = (float) kv_float(ctx, "phi3.rope.freq_base");
-    h.rope_attn_factor = (float) kv_float(ctx, "phi3.rope.scaling.attn_factor");
-    h.bos_id          = kv_int(ctx, "tokenizer.ggml.bos_token_id");
-    h.eos_id          = kv_int(ctx, "tokenizer.ggml.eos_token_id");
+    h.arch_name = kv_string(ctx, "general.architecture");
+    if      (h.arch_name == "phi3")  h.arch = arch_t::PHI3;
+    else if (h.arch_name == "qwen2") h.arch = arch_t::QWEN2;
+    else {
+        fprintf(stderr, "error: unsupported architecture '%s' (supported: phi3, qwen2)\n",
+                h.arch_name.c_str());
+        exit(1);
+    }
+
+    auto pfx = [&](const char * suffix) { return h.arch_name + "." + suffix; };
+
+    h.n_embd    = kv_int(ctx, pfx("embedding_length").c_str());
+    h.n_head    = kv_int(ctx, pfx("attention.head_count").c_str());
+    h.n_head_kv = kv_int(ctx, pfx("attention.head_count_kv").c_str());
+    h.n_layer   = kv_int(ctx, pfx("block_count").c_str());
+    h.n_ff      = kv_int(ctx, pfx("feed_forward_length").c_str());
+    h.rms_eps   = (float) kv_float(ctx, pfx("attention.layer_norm_rms_epsilon").c_str());
+    h.rope_freq_base = (float) kv_float(ctx, pfx("rope.freq_base").c_str());
+
+    int64_t head_dim = h.n_embd / h.n_head;
+    std::string rot_key = pfx("rope.dimension_count");
+    h.n_rot = gguf_find_key(ctx, rot_key.c_str()) >= 0 ? kv_int(ctx, rot_key.c_str()) : head_dim;
+
+    std::string ctx_orig_key = pfx("rope.scaling.original_context_length");
+    h.has_rope_scaling = gguf_find_key(ctx, ctx_orig_key.c_str()) >= 0;
+    if (h.has_rope_scaling) {
+        h.n_ctx_orig       = kv_int(ctx, ctx_orig_key.c_str());
+        h.rope_attn_factor = (float) kv_float(ctx, pfx("rope.scaling.attn_factor").c_str());
+    } else {
+        h.n_ctx_orig       = kv_int(ctx, pfx("context_length").c_str()); // unused when ext_factor=0
+        h.rope_attn_factor = 1.0f;
+    }
+
+    h.qkv_fused    = (h.arch == arch_t::PHI3);
+    h.has_qkv_bias = (h.arch == arch_t::QWEN2);
+    h.ffn_fused    = (h.arch == arch_t::PHI3);
+    h.tied_output  = (h.arch == arch_t::PHI3);
+
+    h.bos_id = kv_int(ctx, "tokenizer.ggml.bos_token_id");
+    h.eos_id = kv_int(ctx, "tokenizer.ggml.eos_token_id");
     return h;
 }
 
@@ -258,6 +295,50 @@ vocab load_vocab(const gguf_context * ctx) {
     return v;
 }
 
+int32_t vocab::special(const char * tag) const {
+    auto it = token_to_id.find(tag);
+    if (it == token_to_id.end()) {
+        fprintf(stderr, "error: model vocab has no special token '%s'\n", tag);
+        exit(1);
+    }
+    return it->second;
+}
+
+// ---- chat templates (one hardcoded format per architecture, not a Jinja engine -- see model.h) ----
+
+void append_chat_turn(const hparams & hp, const vocab & vc, std::vector<int32_t> & out,
+                       const std::string & role, const std::string & text) {
+    if (hp.arch == arch_t::PHI3) {
+        out.push_back(vc.special(("<|" + role + "|>").c_str()));
+        std::vector<int32_t> enc = vc.encode(text);
+        out.insert(out.end(), enc.begin(), enc.end());
+        out.push_back(vc.special("<|end|>"));
+    } else { // QWEN2: ChatML, "<|im_start|>{role}\n{text}<|im_end|>\n"
+        out.push_back(vc.special("<|im_start|>"));
+        std::vector<int32_t> role_enc = vc.encode(role + "\n");
+        out.insert(out.end(), role_enc.begin(), role_enc.end());
+        std::vector<int32_t> enc = vc.encode(text);
+        out.insert(out.end(), enc.begin(), enc.end());
+        out.push_back(vc.special("<|im_end|>"));
+        std::vector<int32_t> nl = vc.encode("\n");
+        out.insert(out.end(), nl.begin(), nl.end());
+    }
+}
+
+void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<int32_t> & out) {
+    if (hp.arch == arch_t::PHI3) {
+        out.push_back(vc.special("<|assistant|>"));
+    } else {
+        out.push_back(vc.special("<|im_start|>"));
+        std::vector<int32_t> enc = vc.encode("assistant\n");
+        out.insert(out.end(), enc.begin(), enc.end());
+    }
+}
+
+int32_t turn_end_token(const hparams & hp, const vocab & vc) {
+    return vc.special(hp.arch == arch_t::PHI3 ? "<|end|>" : "<|im_end|>");
+}
+
 // ---- model weights ----
 
 static struct ggml_tensor * must_get(struct ggml_context * ctx, const std::string & name) {
@@ -271,19 +352,42 @@ static struct ggml_tensor * must_get(struct ggml_context * ctx, const std::strin
 
 model load_model(struct ggml_context * wctx, const hparams & hp) {
     model m;
-    m.token_embd          = must_get(wctx, "token_embd.weight");
-    m.output_norm          = must_get(wctx, "output_norm.weight");
-    m.rope_factors_short   = must_get(wctx, "rope_factors_short.weight");
+    m.token_embd  = must_get(wctx, "token_embd.weight");
+    m.output_norm = must_get(wctx, "output_norm.weight");
+    m.output      = hp.tied_output ? m.token_embd : must_get(wctx, "output.weight");
+
+    if (hp.has_rope_scaling) {
+        m.rope_factors = must_get(wctx, "rope_factors_short.weight"); // phi3 LongRoPE
+    }
+
     m.layers.resize(hp.n_layer);
     for (int64_t il = 0; il < hp.n_layer; il++) {
         std::string p = "blk." + std::to_string(il) + ".";
         layer_weights & l = m.layers[il];
         l.attn_norm   = must_get(wctx, p + "attn_norm.weight");
-        l.attn_qkv    = must_get(wctx, p + "attn_qkv.weight");
         l.attn_output = must_get(wctx, p + "attn_output.weight");
         l.ffn_norm    = must_get(wctx, p + "ffn_norm.weight");
-        l.ffn_up      = must_get(wctx, p + "ffn_up.weight");
         l.ffn_down    = must_get(wctx, p + "ffn_down.weight");
+
+        if (hp.qkv_fused) {
+            l.attn_qkv = must_get(wctx, p + "attn_qkv.weight");
+        } else {
+            l.attn_q = must_get(wctx, p + "attn_q.weight");
+            l.attn_k = must_get(wctx, p + "attn_k.weight");
+            l.attn_v = must_get(wctx, p + "attn_v.weight");
+            if (hp.has_qkv_bias) {
+                l.attn_q_bias = must_get(wctx, p + "attn_q.bias");
+                l.attn_k_bias = must_get(wctx, p + "attn_k.bias");
+                l.attn_v_bias = must_get(wctx, p + "attn_v.bias");
+            }
+        }
+
+        if (hp.ffn_fused) {
+            l.ffn_up_gate = must_get(wctx, p + "ffn_up.weight");
+        } else {
+            l.ffn_gate = must_get(wctx, p + "ffn_gate.weight");
+            l.ffn_up   = must_get(wctx, p + "ffn_up.weight");
+        }
     }
     return m;
 }
@@ -329,6 +433,57 @@ static struct ggml_tensor * rms_norm_mul(struct ggml_context * ctx, struct ggml_
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
 }
 
+// Builds Q/K/V for one layer from the post-attn-norm input `x`, as [head_dim, n_head(_kv), n_new]
+// tensors ready for RoPE. Branches on hparams::qkv_fused: phi3 has one fused attn_qkv weight
+// (split via strided views, since mul_mat's single output can't be reshaped directly), qwen2 has
+// separate attn_q/k/v (+ bias) weights (each a fresh contiguous mul_mat output, so reshape works).
+static void build_qkv(struct ggml_context * ctx, const hparams & hp, const layer_weights & l,
+                       struct ggml_tensor * x, int64_t n_new, int64_t head_dim,
+                       struct ggml_tensor ** out_Q, struct ggml_tensor ** out_K,
+                       struct ggml_tensor ** out_V) {
+    const size_t es = sizeof(float);
+    if (hp.qkv_fused) {
+        struct ggml_tensor * qkv = ggml_mul_mat(ctx, l.attn_qkv, x); // [n_embd + 2*n_embd_kv, n_new]
+        *out_Q = ggml_view_3d(ctx, qkv, head_dim, hp.n_head, n_new,
+                               head_dim * es, qkv->nb[1], 0);
+        *out_K = ggml_view_3d(ctx, qkv, head_dim, hp.n_head_kv, n_new,
+                               head_dim * es, qkv->nb[1], hp.n_head * head_dim * es);
+        *out_V = ggml_view_3d(ctx, qkv, head_dim, hp.n_head_kv, n_new,
+                               head_dim * es, qkv->nb[1], (hp.n_head + hp.n_head_kv) * head_dim * es);
+    } else {
+        struct ggml_tensor * q = ggml_mul_mat(ctx, l.attn_q, x); // [n_head*head_dim, n_new]
+        struct ggml_tensor * k = ggml_mul_mat(ctx, l.attn_k, x); // [n_head_kv*head_dim, n_new]
+        struct ggml_tensor * v = ggml_mul_mat(ctx, l.attn_v, x);
+        if (hp.has_qkv_bias) {
+            q = ggml_add(ctx, q, l.attn_q_bias);
+            k = ggml_add(ctx, k, l.attn_k_bias);
+            v = ggml_add(ctx, v, l.attn_v_bias);
+        }
+        *out_Q = ggml_reshape_3d(ctx, q, head_dim, hp.n_head, n_new);
+        *out_K = ggml_reshape_3d(ctx, k, head_dim, hp.n_head_kv, n_new);
+        *out_V = ggml_reshape_3d(ctx, v, head_dim, hp.n_head_kv, n_new);
+    }
+}
+
+// SwiGLU FFN activation (silu(gate) * up), before the down projection. Branches on
+// hparams::ffn_fused: phi3 packs gate+up into one ffn_up weight (split via a strided view),
+// qwen2 has separate ffn_gate/ffn_up weights.
+static struct ggml_tensor * build_ffn_act(struct ggml_context * ctx, const hparams & hp,
+                                           const layer_weights & l, struct ggml_tensor * y,
+                                           int64_t n_new) {
+    struct ggml_tensor * gate;
+    struct ggml_tensor * up;
+    if (hp.ffn_fused) {
+        struct ggml_tensor * gate_up = ggml_mul_mat(ctx, l.ffn_up_gate, y); // [2*n_ff, n_new]
+        gate = ggml_view_2d(ctx, gate_up, hp.n_ff, n_new, gate_up->nb[1], 0);
+        up   = ggml_view_2d(ctx, gate_up, hp.n_ff, n_new, gate_up->nb[1], hp.n_ff * sizeof(float));
+    } else {
+        gate = ggml_mul_mat(ctx, l.ffn_gate, y);
+        up   = ggml_mul_mat(ctx, l.ffn_up, y);
+    }
+    return ggml_mul(ctx, ggml_silu(ctx, gate), up);
+}
+
 static built_graph build_graph(struct ggml_context * ctx, const model & m, const hparams & hp,
                                 kv_cache & kv, int64_t n_past, int64_t n_new) {
     built_graph bg{};
@@ -337,7 +492,6 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
     const int64_t head_dim = hp.n_embd / hp.n_head;
     const int64_t n_kv     = n_past + n_new;
     const float   kq_scale = 1.0f / sqrtf((float) head_dim);
-    const size_t  es       = sizeof(float); // element size of the F32 mul_mat outputs we slice
 
     bg.tokens    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_new);
     bg.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_new);
@@ -345,29 +499,31 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
 
     struct ggml_tensor * cur = ggml_get_rows(ctx, m.token_embd, bg.tokens); // [n_embd, n_new]
 
+    // ext_factor=1 (LongRoPE/YaRN blending) only for phi3; plain RoPE otherwise (ext_factor=0
+    // disables the blend entirely, per ggml_rope_ext's documented defaults)
+    const float rope_ext_factor  = hp.has_rope_scaling ? 1.0f : 0.0f;
+    const float rope_beta_fast   = hp.has_rope_scaling ? 32.0f : 0.0f;
+    const float rope_beta_slow   = hp.has_rope_scaling ? 1.0f : 0.0f;
+
     for (int64_t il = 0; il < hp.n_layer; il++) {
         const layer_weights & l = m.layers[il];
         struct ggml_tensor * residual = cur;
 
         struct ggml_tensor * x = rms_norm_mul(ctx, cur, l.attn_norm, hp.rms_eps);
 
-        struct ggml_tensor * qkv = ggml_mul_mat(ctx, l.attn_qkv, x); // [n_embd + 2*n_embd_kv, n_new]
+        struct ggml_tensor * Qcur;
+        struct ggml_tensor * Kcur;
+        struct ggml_tensor * Vcur;
+        build_qkv(ctx, hp, l, x, n_new, head_dim, &Qcur, &Kcur, &Vcur);
 
-        struct ggml_tensor * Qcur = ggml_view_3d(ctx, qkv, head_dim, hp.n_head, n_new,
-                                                  head_dim * es, qkv->nb[1], 0);
-        struct ggml_tensor * Kcur = ggml_view_3d(ctx, qkv, head_dim, hp.n_head_kv, n_new,
-                                                  head_dim * es, qkv->nb[1],
-                                                  hp.n_head * head_dim * es);
-        struct ggml_tensor * Vcur = ggml_view_3d(ctx, qkv, head_dim, hp.n_head_kv, n_new,
-                                                  head_dim * es, qkv->nb[1],
-                                                  (hp.n_head + hp.n_head_kv) * head_dim * es);
-
-        Qcur = ggml_rope_ext(ctx, Qcur, bg.positions, m.rope_factors_short,
+        Qcur = ggml_rope_ext(ctx, Qcur, bg.positions, m.rope_factors,
                               (int) hp.n_rot, GGML_ROPE_TYPE_NEOX, (int) hp.n_ctx_orig,
-                              hp.rope_freq_base, 1.0f, 1.0f, hp.rope_attn_factor, 32.0f, 1.0f);
-        Kcur = ggml_rope_ext(ctx, Kcur, bg.positions, m.rope_factors_short,
+                              hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
+                              rope_beta_fast, rope_beta_slow);
+        Kcur = ggml_rope_ext(ctx, Kcur, bg.positions, m.rope_factors,
                               (int) hp.n_rot, GGML_ROPE_TYPE_NEOX, (int) hp.n_ctx_orig,
-                              hp.rope_freq_base, 1.0f, 1.0f, hp.rope_attn_factor, 32.0f, 1.0f);
+                              hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
+                              rope_beta_fast, rope_beta_slow);
 
         // write the newest K/V (post-RoPE for K) into the persistent cache at [n_past, n_past+n_new)
         struct ggml_tensor * k_dst = ggml_view_3d(ctx, kv.k[il], head_dim, hp.n_head_kv, n_new,
@@ -402,19 +558,14 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
 
         residual = cur;
         struct ggml_tensor * y = rms_norm_mul(ctx, cur, l.ffn_norm, hp.rms_eps);
-
-        struct ggml_tensor * gate_up = ggml_mul_mat(ctx, l.ffn_up, y); // [2*n_ff, n_new]
-        struct ggml_tensor * gate = ggml_view_2d(ctx, gate_up, hp.n_ff, n_new, gate_up->nb[1], 0);
-        struct ggml_tensor * up   = ggml_view_2d(ctx, gate_up, hp.n_ff, n_new, gate_up->nb[1],
-                                                  hp.n_ff * es);
-        struct ggml_tensor * ffn_act = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+        struct ggml_tensor * ffn_act = build_ffn_act(ctx, hp, l, y, n_new);
 
         cur = ggml_mul_mat(ctx, l.ffn_down, ffn_act);
         cur = ggml_add(ctx, cur, residual);
     }
 
     cur = rms_norm_mul(ctx, cur, m.output_norm, hp.rms_eps);
-    bg.logits = ggml_mul_mat(ctx, m.token_embd, cur); // tied embeddings: [n_vocab, n_new]
+    bg.logits = ggml_mul_mat(ctx, m.output, cur); // [n_vocab, n_new]
 
     ggml_build_forward_expand(bg.gf, bg.logits);
     return bg;

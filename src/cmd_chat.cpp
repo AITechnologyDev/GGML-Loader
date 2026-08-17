@@ -1,9 +1,8 @@
 // `ggml-loader chat <model.gguf> [--system "text"]`: interactive multi-turn chat.
-// Uses the phi3/Phi-4 instruct chat format directly (hardcoded, not a Jinja engine):
-//   <|system|>{text}<|end|>  <|user|>{text}<|end|>  <|assistant|>{text}<|end|>  ...
-// which is exactly what this model's tokenizer.ggml.chat_template renders for plain
-// (non-tool-calling) messages. Multi-turn history lives entirely in the persistent KV cache --
-// each turn only encodes/prefills the newest user message, not the whole conversation.
+// Chat formatting (append_chat_turn/append_generation_prompt/turn_end_token) is
+// architecture-specific -- see model.cpp -- so this file doesn't hardcode any model family's
+// template. Multi-turn history lives entirely in the persistent KV cache -- each turn only
+// encodes/prefills the newest user message, not the whole conversation.
 #include "commands.h"
 #include "model.h"
 
@@ -19,15 +18,6 @@
 
 static void print_usage(const char * argv0) {
     fprintf(stderr, "usage: %s [model.gguf] [--system \"text\"]\n", argv0);
-}
-
-static int32_t special_token(const vocab & vc, const char * tag) {
-    auto it = vc.token_to_id.find(tag);
-    if (it == vc.token_to_id.end()) {
-        fprintf(stderr, "error: model vocab has no special token '%s' -- chat template unsupported\n", tag);
-        exit(1);
-    }
-    return it->second;
 }
 
 int cmd_chat(int argc, char ** argv) {
@@ -60,27 +50,20 @@ int cmd_chat(int argc, char ** argv) {
     vocab   vc = load_vocab(gctx);
     model   m  = load_model(wctx, hp);
     const int64_t n_vocab = m.token_embd->ne[1];
-
-    const int32_t tok_system    = special_token(vc, "<|system|>");
-    const int32_t tok_user      = special_token(vc, "<|user|>");
-    const int32_t tok_assistant = special_token(vc, "<|assistant|>");
-    const int32_t tok_end       = special_token(vc, "<|end|>");
+    const int32_t tok_end = turn_end_token(hp, vc);
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(backend, 8);
     kv_cache kv = init_kv_cache(hp, backend);
     decode_session ds = init_decode_session();
 
-    fprintf(stderr, "%s loaded (%lld layers). Type a message and press Enter "
+    fprintf(stderr, "%s loaded (%s, %lld layers). Type a message and press Enter "
                      "(Ctrl-D or 'exit' to quit).\n",
-            model_path.c_str(), (long long) hp.n_layer);
+            model_path.c_str(), hp.arch_name.c_str(), (long long) hp.n_layer);
 
     std::vector<int32_t> pending = { (int32_t) hp.bos_id };
     if (!system_prompt.empty()) {
-        pending.push_back(tok_system);
-        std::vector<int32_t> enc = vc.encode(system_prompt);
-        pending.insert(pending.end(), enc.begin(), enc.end());
-        pending.push_back(tok_end);
+        append_chat_turn(hp, vc, pending, "system", system_prompt);
     }
 
     int64_t n_past = 0;
@@ -94,11 +77,8 @@ int cmd_chat(int argc, char ** argv) {
         if (line == "exit" || line == "quit") break;
         if (line.empty()) continue;
 
-        pending.push_back(tok_user);
-        std::vector<int32_t> enc = vc.encode(line);
-        pending.insert(pending.end(), enc.begin(), enc.end());
-        pending.push_back(tok_end);
-        pending.push_back(tok_assistant);
+        append_chat_turn(hp, vc, pending, "user", line);
+        append_generation_prompt(hp, vc, pending);
 
         if (n_past + (int64_t) pending.size() + max_reply_tokens > N_CTX_MAX) {
             fprintf(stderr, "\n[context window full (%lld tokens) -- restart to continue]\n",
@@ -129,7 +109,7 @@ int cmd_chat(int argc, char ** argv) {
             next = argmax(step_logits);
         }
         // commit the terminator itself to the cache so history matches the chat template
-        // exactly ("...<|assistant|>{reply}<|end|>") for the next turn's context
+        // exactly for the next turn's context
         forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab);
         n_past += 1;
         auto t3 = std::chrono::steady_clock::now();
