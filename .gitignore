@@ -1,0 +1,6 @@
+build/
+*.gguf
+*.safetensors
+.cache/
+.claude/
+.git/
