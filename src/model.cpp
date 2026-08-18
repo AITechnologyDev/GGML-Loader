@@ -1,11 +1,14 @@
 #include "model.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
+#include "ggml-vulkan.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 static int64_t kv_find(const gguf_context * ctx, const char * key) {
     int64_t id = gguf_find_key(ctx, key);
@@ -438,6 +441,69 @@ model load_model(struct ggml_context * wctx, const hparams & hp) {
     return m;
 }
 
+weights_store load_weights(const char * path, ggml_backend_t backend, struct gguf_context ** out_gguf) {
+    struct ggml_context * meta_ctx = nullptr;
+    struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta_ctx };
+    struct gguf_context * gctx = gguf_init_from_file(path, gp);
+    if (!gctx || !meta_ctx) {
+        fprintf(stderr, "error: failed to load '%s'\n", path);
+        exit(1);
+    }
+
+    weights_store ws;
+    ws.ctx = meta_ctx;
+    ws.buffer = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
+    if (!ws.buffer) {
+        fprintf(stderr, "error: failed to allocate backend memory for weights from '%s'\n", path);
+        exit(1);
+    }
+
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "error: failed to reopen '%s' to read tensor data\n", path);
+        exit(1);
+    }
+    size_t data_base = gguf_get_data_offset(gctx);
+    int64_t n_tensors = gguf_get_n_tensors(gctx);
+    std::vector<uint8_t> buf;
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gctx, i);
+        struct ggml_tensor * t = ggml_get_tensor(meta_ctx, name);
+        size_t size = ggml_nbytes(t);
+        size_t offset = data_base + gguf_get_tensor_offset(gctx, i);
+        buf.resize(size);
+        if (fseek(f, (long) offset, SEEK_SET) != 0 || fread(buf.data(), 1, size, f) != size) {
+            fprintf(stderr, "error: failed to read tensor '%s' from '%s'\n", name, path);
+            exit(1);
+        }
+        ggml_backend_tensor_set(t, buf.data(), 0, size);
+    }
+    fclose(f);
+
+    *out_gguf = gctx;
+    return ws;
+}
+
+ggml_backend_t init_backend(const std::string & name, int n_threads) {
+    if (name == "cpu") {
+        ggml_backend_t backend = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+        return backend;
+    }
+    if (name == "vulkan") {
+        if (ggml_backend_vk_get_device_count() == 0) {
+            fprintf(stderr, "error: backend 'vulkan' requested but no Vulkan device is available\n");
+            exit(1);
+        }
+        char desc[256];
+        ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+        fprintf(stderr, "vulkan device 0: %s\n", desc);
+        return ggml_backend_vk_init(0);
+    }
+    fprintf(stderr, "error: unknown backend '%s' (expected cpu or vulkan)\n", name.c_str());
+    exit(1);
+}
+
 // ---- persistent KV cache ----
 
 kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend) {
@@ -627,11 +693,11 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
     return bg;
 }
 
-decode_session init_decode_session() {
+decode_session init_decode_session(ggml_backend_t backend) {
     decode_session ds;
     size_t buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
     ds.graph_buf.resize(buf_size);
-    ds.galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    ds.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     return ds;
 }
 

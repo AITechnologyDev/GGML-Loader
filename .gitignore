@@ -6,3 +6,5 @@ build/
 .git/
 .env
 .env.*
+*_architecture/
+*_Architecture/

@@ -157,6 +157,21 @@ struct model {
 
 model load_model(struct ggml_context * wctx, const hparams & hp);
 
+// Loads every tensor from a GGUF file into memory owned by `backend` -- works for any backend,
+// including GPU ones like Vulkan, unlike gguf_init_from_file(no_alloc=false) which only ever
+// gives plain host (malloc) memory. Reads each tensor's raw bytes directly from the file at its
+// recorded offset and uploads via ggml_backend_tensor_set(), rather than relying on gguf.c's own
+// (CPU-only) bulk loading path.
+struct weights_store {
+    struct ggml_context * ctx = nullptr;    // tensor metadata + backend-owned data; pass to load_model()
+    ggml_backend_buffer_t buffer = nullptr; // owns the tensor data; free with ggml_backend_buffer_free()
+};
+weights_store load_weights(const char * path, ggml_backend_t backend, struct gguf_context ** out_gguf);
+
+// Selects a backend by name ("cpu" or "vulkan"). Exits with an error on an unknown name or if
+// vulkan is requested but this build/device doesn't have it. n_threads only affects "cpu".
+ggml_backend_t init_backend(const std::string & name, int n_threads);
+
 // persistent KV cache: one F16 [head_dim, n_head_kv, N_CTX_MAX] tensor per layer, per K/V.
 struct kv_cache {
     struct ggml_context * ctx = nullptr;
@@ -177,7 +192,7 @@ struct decode_session {
     ggml_gallocr_t galloc = nullptr;
 };
 
-decode_session init_decode_session();
+decode_session init_decode_session(ggml_backend_t backend);
 void free_decode_session(decode_session & ds);
 
 // Runs one forward pass for `new_tokens`, appending them to the KV cache at [n_past, n_past +
