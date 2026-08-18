@@ -8,3 +8,5 @@ build/
 .env.*
 *_architecture/
 *_Architecture/
+sdxl_model/
+reference/
