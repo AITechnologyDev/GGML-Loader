@@ -22,6 +22,7 @@ add_executable(ggml-loader
     src/cmd_inspect.cpp
     src/cmd_run.cpp
     src/cmd_chat.cpp
+    src/cmd_bench.cpp
 )
 target_link_libraries(ggml-loader PRIVATE ggml)
 target_include_directories(ggml-loader PRIVATE src)
