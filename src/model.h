@@ -12,8 +12,11 @@
 // Currently supported: phi3 (fused QKV, fused gate+up FFN, LongRoPE partial rotary), qwen2
 // (separate QKV with bias, separate gate/up FFN, plain full RoPE), qwen3 (like qwen2 but no QKV
 // bias, adds per-head QK-Norm before RoPE, and attention width can differ from n_embd/n_head --
-// see n_embd_head). Adding another architecture means extending load_hparams/load_model and, if
-// its chat template differs from both existing ones, append_chat_turn().
+// see n_embd_head), llama (like qwen3's flags minus QK-Norm: separate QKV, no bias, separate
+// gate/up FFN, plain full RoPE). Each of the 4 has its own chat template (see append_chat_turn's
+// switch); llama's is "<|start_header_id|>role<|end_header_id|>\n\ntext<|eot_id|>", distinct from
+// both phi3's and ChatML. Adding another architecture means extending load_hparams/load_model
+// and, if its chat template differs from all existing ones, append_chat_turn()/friends.
 #pragma once
 
 #include "ggml.h"
@@ -36,6 +39,7 @@ enum class arch_t {
     PHI3,
     QWEN2,
     QWEN3,
+    LLAMA,
 };
 
 struct hparams {
@@ -52,6 +56,12 @@ struct hparams {
     int64_t n_layer;
     int64_t n_ff;
     int64_t n_rot;          // rope dimensions to rotate (== n_embd_head for full rotary)
+    bool    rope_neox;      // true: NeoX-style (split-half) rotation, used by phi3/qwen2/qwen3.
+                             // false: "normal" (interleaved-pairs) rotation, used by llama --
+                             // this is a real per-architecture distinction (confirmed against
+                             // llama.cpp's llama_model_rope_type()), not a universal default;
+                             // getting it wrong doesn't crash, it just silently scrambles
+                             // position information (observed: fluent words, broken grammar).
     float   rms_eps;
     float   rope_freq_base;
 

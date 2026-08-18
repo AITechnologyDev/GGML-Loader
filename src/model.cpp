@@ -59,8 +59,9 @@ hparams load_hparams(const gguf_context * ctx) {
     if      (h.arch_name == "phi3")  h.arch = arch_t::PHI3;
     else if (h.arch_name == "qwen2") h.arch = arch_t::QWEN2;
     else if (h.arch_name == "qwen3") h.arch = arch_t::QWEN3;
+    else if (h.arch_name == "llama") h.arch = arch_t::LLAMA;
     else {
-        fprintf(stderr, "error: unsupported architecture '%s' (supported: phi3, qwen2, qwen3)\n",
+        fprintf(stderr, "error: unsupported architecture '%s' (supported: phi3, qwen2, qwen3, llama)\n",
                 h.arch_name.c_str());
         exit(1);
     }
@@ -99,6 +100,7 @@ hparams load_hparams(const gguf_context * ctx) {
     h.has_qkv_bias = (h.arch == arch_t::QWEN2);
     h.has_qk_norm  = (h.arch == arch_t::QWEN3);
     h.ffn_fused    = (h.arch == arch_t::PHI3);
+    h.rope_neox    = (h.arch != arch_t::LLAMA); // llama uses "normal" interleaved-pairs rotation
 
     h.bos_id = kv_int(ctx, "tokenizer.ggml.bos_token_id");
     h.eos_id = kv_int(ctx, "tokenizer.ggml.eos_token_id");
@@ -313,37 +315,67 @@ int32_t vocab::special(const char * tag) const {
 
 // ---- chat templates (one hardcoded format per architecture, not a Jinja engine -- see model.h) ----
 
+static void append_encoded(const vocab & vc, std::vector<int32_t> & out, const std::string & text) {
+    std::vector<int32_t> enc = vc.encode(text);
+    out.insert(out.end(), enc.begin(), enc.end());
+}
+
 void append_chat_turn(const hparams & hp, const vocab & vc, std::vector<int32_t> & out,
                        const std::string & role, const std::string & text) {
-    if (hp.arch == arch_t::PHI3) {
-        out.push_back(vc.special(("<|" + role + "|>").c_str()));
-        std::vector<int32_t> enc = vc.encode(text);
-        out.insert(out.end(), enc.begin(), enc.end());
-        out.push_back(vc.special("<|end|>"));
-    } else { // QWEN2: ChatML, "<|im_start|>{role}\n{text}<|im_end|>\n"
-        out.push_back(vc.special("<|im_start|>"));
-        std::vector<int32_t> role_enc = vc.encode(role + "\n");
-        out.insert(out.end(), role_enc.begin(), role_enc.end());
-        std::vector<int32_t> enc = vc.encode(text);
-        out.insert(out.end(), enc.begin(), enc.end());
-        out.push_back(vc.special("<|im_end|>"));
-        std::vector<int32_t> nl = vc.encode("\n");
-        out.insert(out.end(), nl.begin(), nl.end());
+    switch (hp.arch) {
+        case arch_t::PHI3:
+            out.push_back(vc.special(("<|" + role + "|>").c_str()));
+            append_encoded(vc, out, text);
+            out.push_back(vc.special("<|end|>"));
+            break;
+        case arch_t::LLAMA: // "<|start_header_id|>{role}<|end_header_id|>\n\n{text}<|eot_id|>"
+            out.push_back(vc.special("<|start_header_id|>"));
+            append_encoded(vc, out, role);
+            out.push_back(vc.special("<|end_header_id|>"));
+            append_encoded(vc, out, "\n\n");
+            append_encoded(vc, out, text);
+            out.push_back(vc.special("<|eot_id|>"));
+            break;
+        case arch_t::QWEN2: // ChatML: "<|im_start|>{role}\n{text}<|im_end|>\n"
+        case arch_t::QWEN3:
+        default:
+            out.push_back(vc.special("<|im_start|>"));
+            append_encoded(vc, out, role + "\n");
+            append_encoded(vc, out, text);
+            out.push_back(vc.special("<|im_end|>"));
+            append_encoded(vc, out, "\n");
+            break;
     }
 }
 
 void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<int32_t> & out) {
-    if (hp.arch == arch_t::PHI3) {
-        out.push_back(vc.special("<|assistant|>"));
-    } else {
-        out.push_back(vc.special("<|im_start|>"));
-        std::vector<int32_t> enc = vc.encode("assistant\n");
-        out.insert(out.end(), enc.begin(), enc.end());
+    switch (hp.arch) {
+        case arch_t::PHI3:
+            out.push_back(vc.special("<|assistant|>"));
+            break;
+        case arch_t::LLAMA:
+            out.push_back(vc.special("<|start_header_id|>"));
+            append_encoded(vc, out, "assistant");
+            out.push_back(vc.special("<|end_header_id|>"));
+            append_encoded(vc, out, "\n\n");
+            break;
+        case arch_t::QWEN2:
+        case arch_t::QWEN3:
+        default:
+            out.push_back(vc.special("<|im_start|>"));
+            append_encoded(vc, out, "assistant\n");
+            break;
     }
 }
 
 int32_t turn_end_token(const hparams & hp, const vocab & vc) {
-    return vc.special(hp.arch == arch_t::PHI3 ? "<|end|>" : "<|im_end|>");
+    switch (hp.arch) {
+        case arch_t::PHI3:  return vc.special("<|end|>");
+        case arch_t::LLAMA: return vc.special("<|eot_id|>");
+        case arch_t::QWEN2:
+        case arch_t::QWEN3:
+        default:             return vc.special("<|im_end|>");
+    }
 }
 
 // ---- model weights ----
@@ -537,12 +569,13 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
             Kcur = rms_norm_mul(ctx, Kcur, l.attn_k_norm, hp.rms_eps);
         }
 
+        const int rope_mode = hp.rope_neox ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
         Qcur = ggml_rope_ext(ctx, Qcur, bg.positions, m.rope_factors,
-                              (int) hp.n_rot, GGML_ROPE_TYPE_NEOX, (int) hp.n_ctx_orig,
+                              (int) hp.n_rot, rope_mode, (int) hp.n_ctx_orig,
                               hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
                               rope_beta_fast, rope_beta_slow);
         Kcur = ggml_rope_ext(ctx, Kcur, bg.positions, m.rope_factors,
-                              (int) hp.n_rot, GGML_ROPE_TYPE_NEOX, (int) hp.n_ctx_orig,
+                              (int) hp.n_rot, rope_mode, (int) hp.n_ctx_orig,
                               hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
                               rope_beta_fast, rope_beta_slow);
 
