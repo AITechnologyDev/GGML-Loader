@@ -11,12 +11,16 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
 
 static void print_usage(const char * argv0) {
-    fprintf(stderr, "usage: %s [model.gguf] [--system \"text\"] [--backend cpu|vulkan]\n", argv0);
+    fprintf(stderr,
+        "usage: %s [model.gguf] [--system \"text\"] [--backend cpu|vulkan]\n"
+        "           [--temp F] [--top-k N] [--top-p F] [--repeat-penalty F] [--repeat-last-n N] [--seed N]\n"
+        "  temp<=0 (default): greedy/deterministic, same as before these flags existed\n", argv0);
 }
 
 int cmd_chat(int argc, char ** argv) {
@@ -24,6 +28,7 @@ int cmd_chat(int argc, char ** argv) {
     bool model_path_set = false;
     std::string system_prompt;
     std::string backend_name = "cpu";
+    sampler_params sp;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -31,6 +36,18 @@ int cmd_chat(int argc, char ** argv) {
             system_prompt = argv[++i];
         } else if (a == "--backend" && i + 1 < argc) {
             backend_name = argv[++i];
+        } else if (a == "--temp" && i + 1 < argc) {
+            sp.temp = (float) atof(argv[++i]);
+        } else if (a == "--top-k" && i + 1 < argc) {
+            sp.top_k = atoi(argv[++i]);
+        } else if (a == "--top-p" && i + 1 < argc) {
+            sp.top_p = (float) atof(argv[++i]);
+        } else if (a == "--repeat-penalty" && i + 1 < argc) {
+            sp.repeat_penalty = (float) atof(argv[++i]);
+        } else if (a == "--repeat-last-n" && i + 1 < argc) {
+            sp.repeat_last_n = atoi(argv[++i]);
+        } else if (a == "--seed" && i + 1 < argc) {
+            sp.seed = (uint32_t) strtoul(argv[++i], nullptr, 10);
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -39,6 +56,7 @@ int cmd_chat(int argc, char ** argv) {
             model_path_set = true;
         }
     }
+    sampler smp = init_sampler(sp);
 
     ggml_backend_t backend = init_backend(backend_name, 8);
 
@@ -70,6 +88,7 @@ int cmd_chat(int argc, char ** argv) {
 
     int64_t n_past = 0;
     const int max_reply_tokens = 512;
+    std::vector<int32_t> history; // recent tokens for repeat_penalty; KV cache handles real context
 
     while (true) {
         printf("> ");
@@ -95,20 +114,22 @@ int cmd_chat(int argc, char ** argv) {
         double prefill_s = std::chrono::duration<double>(t1 - t0).count();
         double prefill_tps = pending.size() / prefill_s;
         size_t n_prefill = pending.size();
+        history.insert(history.end(), pending.begin(), pending.end());
         pending.clear(); // this turn's tokens are now committed to the KV cache via n_past
 
-        int32_t next = argmax(logits);
+        int32_t next = sample(smp, logits, history);
         int n_reply = 0;
         auto t2 = std::chrono::steady_clock::now();
         while (n_reply < max_reply_tokens && next != tok_end && next != hp.eos_id && next != tok_eot) {
             std::string piece = vc.detok({ next });
             fputs(piece.c_str(), stdout);
             fflush(stdout);
+            history.push_back(next);
 
             std::vector<float> step_logits = forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab);
             n_past += 1;
             n_reply++;
-            next = argmax(step_logits);
+            next = sample(smp, step_logits, history);
         }
         // commit the terminator itself to the cache so history matches the chat template
         // exactly for the next turn's context

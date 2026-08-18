@@ -16,7 +16,9 @@
 static void print_usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s [model.gguf] [-p/--prompt \"text\"] [-n/--n-predict N] [--backend cpu|vulkan]\n"
-        "  no -p: BOS-seeded unconditional free-run\n", argv0);
+        "           [--temp F] [--top-k N] [--top-p F] [--repeat-penalty F] [--repeat-last-n N] [--seed N]\n"
+        "  no -p: BOS-seeded unconditional free-run\n"
+        "  temp<=0 (default): greedy/deterministic, same as before these flags existed\n", argv0);
 }
 
 int cmd_run(int argc, char ** argv) {
@@ -25,6 +27,7 @@ int cmd_run(int argc, char ** argv) {
     std::string prompt;
     std::string backend_name = "cpu";
     int max_new_tokens = 32;
+    sampler_params sp;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -34,6 +37,18 @@ int cmd_run(int argc, char ** argv) {
             max_new_tokens = atoi(argv[++i]);
         } else if (a == "--backend" && i + 1 < argc) {
             backend_name = argv[++i];
+        } else if (a == "--temp" && i + 1 < argc) {
+            sp.temp = (float) atof(argv[++i]);
+        } else if (a == "--top-k" && i + 1 < argc) {
+            sp.top_k = atoi(argv[++i]);
+        } else if (a == "--top-p" && i + 1 < argc) {
+            sp.top_p = (float) atof(argv[++i]);
+        } else if (a == "--repeat-penalty" && i + 1 < argc) {
+            sp.repeat_penalty = (float) atof(argv[++i]);
+        } else if (a == "--repeat-last-n" && i + 1 < argc) {
+            sp.repeat_last_n = atoi(argv[++i]);
+        } else if (a == "--seed" && i + 1 < argc) {
+            sp.seed = (uint32_t) strtoul(argv[++i], nullptr, 10);
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -42,6 +57,7 @@ int cmd_run(int argc, char ** argv) {
             model_path_set = true;
         }
     }
+    sampler smp = init_sampler(sp);
 
     ggml_backend_t backend = init_backend(backend_name, 8);
 
@@ -91,7 +107,7 @@ int cmd_run(int argc, char ** argv) {
 
     std::vector<int32_t> all_tokens = prompt_tokens;
     int64_t n_past = (int64_t) prompt_tokens.size();
-    int32_t next = argmax(logits);
+    int32_t next = sample(smp, logits, all_tokens);
 
     fprintf(stderr, "prefill: %zu tokens in %.3fs (%.2f tok/s)\n",
             prompt_tokens.size(), prefill_s, prompt_tokens.size() / prefill_s);
@@ -114,7 +130,7 @@ int cmd_run(int argc, char ** argv) {
 
         std::vector<float> step_logits = forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab);
         n_past += 1;
-        next = argmax(step_logits);
+        next = sample(smp, step_logits, all_tokens);
     }
     auto t3 = std::chrono::steady_clock::now();
     double decode_s = std::chrono::duration<double>(t3 - t2).count();

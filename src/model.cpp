@@ -4,10 +4,12 @@
 #include "ggml-cpu.h"
 #include "ggml-vulkan.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <vector>
 
 static int64_t kv_find(const gguf_context * ctx, const char * key) {
@@ -761,4 +763,66 @@ int32_t argmax(const std::vector<float> & logits) {
         if (logits[i] > best_v) { best_v = logits[i]; best = (int32_t) i; }
     }
     return best;
+}
+
+sampler init_sampler(const sampler_params & params) {
+    sampler smp;
+    smp.params = params;
+    smp.rng.seed(params.seed != 0 ? params.seed : std::random_device{}());
+    return smp;
+}
+
+int32_t sample(sampler & smp, std::vector<float> & logits, const std::vector<int32_t> & recent_tokens) {
+    const sampler_params & p = smp.params;
+
+    if (p.repeat_penalty != 1.0f && !recent_tokens.empty()) {
+        size_t start = recent_tokens.size() > (size_t) p.repeat_last_n
+                            ? recent_tokens.size() - (size_t) p.repeat_last_n : 0;
+        for (size_t i = start; i < recent_tokens.size(); i++) {
+            int32_t id = recent_tokens[i];
+            if (id < 0 || (size_t) id >= logits.size()) continue;
+            float & l = logits[id];
+            l = l > 0.0f ? l / p.repeat_penalty : l * p.repeat_penalty;
+        }
+    }
+
+    if (p.temp <= 0.0f) {
+        return argmax(logits);
+    }
+
+    std::vector<int32_t> ids(logits.size());
+    for (size_t i = 0; i < logits.size(); i++) ids[i] = (int32_t) i;
+
+    size_t k = (p.top_k > 0 && (size_t) p.top_k < ids.size()) ? (size_t) p.top_k : ids.size();
+    std::partial_sort(ids.begin(), ids.begin() + k, ids.end(),
+                       [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+    ids.resize(k);
+
+    float max_logit = logits[ids[0]];
+    std::vector<float> probs(ids.size());
+    float sum = 0.0f;
+    for (size_t i = 0; i < ids.size(); i++) {
+        probs[i] = expf((logits[ids[i]] - max_logit) / p.temp);
+        sum += probs[i];
+    }
+    for (float & pr : probs) pr /= sum;
+
+    // ids/probs are sorted descending (from the partial_sort above), so a running cumulative
+    // sum directly gives the nucleus cutoff
+    if (p.top_p < 1.0f) {
+        float cum = 0.0f;
+        size_t cutoff = probs.size();
+        for (size_t i = 0; i < probs.size(); i++) {
+            cum += probs[i];
+            if (cum >= p.top_p) { cutoff = i + 1; break; }
+        }
+        ids.resize(cutoff);
+        probs.resize(cutoff);
+        float s = 0.0f;
+        for (float pr : probs) s += pr;
+        for (float & pr : probs) pr /= s;
+    }
+
+    std::discrete_distribution<size_t> dist(probs.begin(), probs.end());
+    return ids[dist(smp.rng)];
 }

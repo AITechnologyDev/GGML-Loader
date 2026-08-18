@@ -25,6 +25,7 @@
 
 #include <array>
 #include <cstdint>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -203,3 +204,28 @@ std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & 
                                  const std::vector<int32_t> & new_tokens, int64_t n_vocab);
 
 int32_t argmax(const std::vector<float> & logits);
+
+// Sampling: temp<=0 is greedy (== argmax, deterministic) -- this is the default everywhere
+// (run/chat/bench) so nothing changes unless a caller explicitly opts in via CLI flags. Above
+// that: temperature scaling, then top-k, then top-p (nucleus) narrow the candidate set before a
+// weighted random draw. repeat_penalty (1.0 = disabled) downweights tokens seen in the last
+// repeat_last_n tokens of `recent_tokens` -- applied even at temp<=0, since it doesn't need
+// randomness to stop greedy decoding's "Paris is the capital of France. Paris is..." loops.
+struct sampler_params {
+    float    temp            = 0.0f;
+    int      top_k           = 40;
+    float    top_p           = 0.95f;
+    float    repeat_penalty  = 1.0f;
+    int      repeat_last_n   = 64;
+    uint32_t seed            = 0; // 0 = seed from std::random_device
+};
+
+struct sampler {
+    sampler_params params;
+    std::mt19937 rng;
+};
+
+sampler init_sampler(const sampler_params & params);
+
+// mutates `logits` in place (repetition penalty); returns the sampled token id
+int32_t sample(sampler & smp, std::vector<float> & logits, const std::vector<int32_t> & recent_tokens);
