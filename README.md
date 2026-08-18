@@ -74,23 +74,25 @@ GPU code, rather than assuming:
 ## Benchmarks (informal, one device, no slogan yet)
 
 `ggml-loader bench`, `-p 128 -n 64 -r 5`, vs `llama-bench` with matching `-p`/`-n`/`-r`, same
-device, Phi-4-mini-instruct Q4_K_M:
+device, Phi-4-mini-instruct Q4_K_M. `llama-bench` numbers are with `-fa on` (flash attention
+made no measurable difference either way -- see below -- these are the fairer of the two runs):
 
 | | pp128 (prefill) | tg64 (decode) |
 | --- | --- | --- |
 | **ggml-loader, cpu**    | 12.04 ± 1.18 | 3.42 ± 0.85 |
 | **ggml-loader, vulkan** | 20.04 ± 0.19 | 10.99 ± 0.06 |
-| llama.cpp, cpu (`-ngl 0`)   | 4.62 ± 0.05 | 2.99 ± 0.25 |
-| llama.cpp, vulkan (`-ngl 99`) | 4.76 ± 0.07 | 9.80 ± 0.06 |
+| llama.cpp, cpu (`-ngl 0 -fa on`)   | 4.79 ± 0.02 | 3.47 ± 0.21 |
+| llama.cpp, vulkan (`-ngl 99 -fa on`) | 4.81 ± 0.03 | 9.81 ± 0.02 |
 
-On this run: ~4.2x faster than llama.cpp's Vulkan on prefill, ~1.12x faster on decode. **Caveat
-before reading too much into it:** this llama-bench run didn't pass `-fa` (flash attention), and
-if that's off by default here, both sides are using an equivalent-effort ("unfused") attention
-path -- meaning the gap is most likely explained by llama.cpp's more general-purpose overhead
-(multi-sequence batching, a more flexible KV cache, speculative-decoding hooks) that this
-narrower, single-purpose implementation doesn't pay, not by faster kernels -- the underlying
-compute ops are the same ggml Vulkan kernels either side. Re-testing with `-fa` enabled, and on
-more than one architecture/model size, is the natural next check before trusting this fully.
+On this run: ~4.2x faster than llama.cpp's Vulkan on prefill, ~1.12x faster on decode.
+Flash attention was tested and ruled out as the explanation (`-fa on` vs off moved llama.cpp's
+numbers by noise-level amounts: pp128 4.76->4.81, tg64 9.80->9.81) -- both this project and
+llama.cpp are using ggml's identical underlying Vulkan kernels either way, so the gap isn't
+"we wrote faster kernels," it's something else, most likely llama.cpp's more general-purpose
+overhead (multi-sequence batching, a more flexible KV cache, speculative-decoding hooks) that
+this narrower, single-purpose implementation doesn't pay -- but that's still an unverified
+hypothesis, not confirmed the way the `-fa` test was. Re-testing on more than one
+architecture/model size is the natural next check before trusting this fully.
 
 ## Building
 
