@@ -31,6 +31,8 @@ add_executable(ggml-loader
     src/cmd_run.cpp
     src/cmd_chat.cpp
     src/cmd_bench.cpp
+    src/cmd_sdxl.cpp
+    src/sdxl_vae.cpp
 )
 target_link_libraries(ggml-loader PRIVATE ggml)
 target_include_directories(ggml-loader PRIVATE src)
