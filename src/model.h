@@ -191,9 +191,13 @@ kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend);
 struct decode_session {
     std::vector<uint8_t> graph_buf;
     ggml_gallocr_t galloc = nullptr;
+    bool use_flash_attn = false; // ggml_flash_attn_ext instead of the manual mul_mat/softmax/
+                                  // mul_mat sequence -- opt-in (default off, matching llama.cpp's
+                                  // own -fa flag) so it can be A/B benchmarked before trusting it
+                                  // not to regress this project's existing lead over llama.cpp.
 };
 
-decode_session init_decode_session(ggml_backend_t backend);
+decode_session init_decode_session(ggml_backend_t backend, bool use_flash_attn = false);
 void free_decode_session(decode_session & ds);
 
 // Runs one forward pass for `new_tokens`, appending them to the KV cache at [n_past, n_past +

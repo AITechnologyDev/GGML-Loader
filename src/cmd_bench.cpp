@@ -19,8 +19,8 @@
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s [model.gguf] [--backend cpu|vulkan] [-p n_prompt] [-n n_gen] [-r repetitions]\n"
-        "  defaults: -p 128 -n 64 -r 3\n", argv0);
+        "usage: %s [model.gguf] [--backend cpu|vulkan] [-p n_prompt] [-n n_gen] [-r repetitions] [--flash-attn]\n"
+        "  defaults: -p 128 -n 64 -r 3, flash-attn off\n", argv0);
 }
 
 struct stats { double mean; double stddev; };
@@ -68,6 +68,7 @@ int cmd_bench(int argc, char ** argv) {
     int n_pp = 128;
     int n_tg = 64;
     int n_reps = 3;
+    bool flash_attn = false;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -79,6 +80,8 @@ int cmd_bench(int argc, char ** argv) {
             n_tg = atoi(argv[++i]);
         } else if (a == "-r" && i + 1 < argc) {
             n_reps = atoi(argv[++i]);
+        } else if (a == "--flash-attn") {
+            flash_attn = true;
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -104,10 +107,10 @@ int cmd_bench(int argc, char ** argv) {
     const int64_t n_vocab = m.token_embd->ne[1];
 
     kv_cache kv = init_kv_cache(hp, backend);
-    decode_session ds = init_decode_session(backend);
+    decode_session ds = init_decode_session(backend, flash_attn);
 
-    fprintf(stderr, "model=%s arch=%s backend=%s n_layer=%lld -- pp%d, tg%d, %d reps (+1 warmup)\n",
-            model_path.c_str(), hp.arch_name.c_str(), backend_name.c_str(),
+    fprintf(stderr, "model=%s arch=%s backend=%s flash_attn=%d n_layer=%lld -- pp%d, tg%d, %d reps (+1 warmup)\n",
+            model_path.c_str(), hp.arch_name.c_str(), backend_name.c_str(), (int) flash_attn,
             (long long) hp.n_layer, n_pp, n_tg, n_reps);
 
     fprintf(stderr, "warmup...\n");

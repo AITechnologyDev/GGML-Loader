@@ -18,7 +18,7 @@
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s [model.gguf] [--system \"text\"] [--backend cpu|vulkan]\n"
+        "usage: %s [model.gguf] [--system \"text\"] [--backend cpu|vulkan] [--flash-attn]\n"
         "           [--temp F] [--top-k N] [--top-p F] [--repeat-penalty F] [--repeat-last-n N] [--seed N]\n"
         "  temp<=0 (default): greedy/deterministic, same as before these flags existed\n", argv0);
 }
@@ -28,6 +28,7 @@ int cmd_chat(int argc, char ** argv) {
     bool model_path_set = false;
     std::string system_prompt;
     std::string backend_name = "cpu";
+    bool flash_attn = false;
     sampler_params sp;
 
     for (int i = 1; i < argc; i++) {
@@ -36,6 +37,8 @@ int cmd_chat(int argc, char ** argv) {
             system_prompt = argv[++i];
         } else if (a == "--backend" && i + 1 < argc) {
             backend_name = argv[++i];
+        } else if (a == "--flash-attn") {
+            flash_attn = true;
         } else if (a == "--temp" && i + 1 < argc) {
             sp.temp = (float) atof(argv[++i]);
         } else if (a == "--top-k" && i + 1 < argc) {
@@ -75,7 +78,7 @@ int cmd_chat(int argc, char ** argv) {
     const int32_t tok_eot = eot_it != vc.token_to_id.end() ? eot_it->second : -1;
 
     kv_cache kv = init_kv_cache(hp, backend);
-    decode_session ds = init_decode_session(backend);
+    decode_session ds = init_decode_session(backend, flash_attn);
 
     fprintf(stderr, "%s loaded (%s, %lld layers, backend=%s). Type a message and press Enter "
                      "(Ctrl-D or 'exit' to quit).\n",

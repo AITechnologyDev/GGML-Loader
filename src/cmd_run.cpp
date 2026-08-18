@@ -15,7 +15,7 @@
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s [model.gguf] [-p/--prompt \"text\"] [-n/--n-predict N] [--backend cpu|vulkan]\n"
+        "usage: %s [model.gguf] [-p/--prompt \"text\"] [-n/--n-predict N] [--backend cpu|vulkan] [--flash-attn]\n"
         "           [--temp F] [--top-k N] [--top-p F] [--repeat-penalty F] [--repeat-last-n N] [--seed N]\n"
         "  no -p: BOS-seeded unconditional free-run\n"
         "  temp<=0 (default): greedy/deterministic, same as before these flags existed\n", argv0);
@@ -27,6 +27,7 @@ int cmd_run(int argc, char ** argv) {
     std::string prompt;
     std::string backend_name = "cpu";
     int max_new_tokens = 32;
+    bool flash_attn = false;
     sampler_params sp;
 
     for (int i = 1; i < argc; i++) {
@@ -37,6 +38,8 @@ int cmd_run(int argc, char ** argv) {
             max_new_tokens = atoi(argv[++i]);
         } else if (a == "--backend" && i + 1 < argc) {
             backend_name = argv[++i];
+        } else if (a == "--flash-attn") {
+            flash_attn = true;
         } else if (a == "--temp" && i + 1 < argc) {
             sp.temp = (float) atof(argv[++i]);
         } else if (a == "--top-k" && i + 1 < argc) {
@@ -92,7 +95,7 @@ int cmd_run(int argc, char ** argv) {
             (long long) hp.n_layer, (long long) hp.n_ff, (long long) hp.n_rot, (long long) n_vocab);
 
     kv_cache kv = init_kv_cache(hp, backend);
-    decode_session ds = init_decode_session(backend);
+    decode_session ds = init_decode_session(backend, flash_attn);
     const int64_t head_dim = hp.n_embd_head;
     const double kv_cache_mib =
         (double)(hp.n_layer * 2 * N_CTX_MAX * hp.n_head_kv * head_dim * 2) / (1024.0 * 1024.0);

@@ -599,7 +599,8 @@ static struct ggml_tensor * build_ffn_act(struct ggml_context * ctx, const hpara
 }
 
 static built_graph build_graph(struct ggml_context * ctx, const model & m, const hparams & hp,
-                                kv_cache & kv, int64_t n_past, int64_t n_new) {
+                                kv_cache & kv, int64_t n_past, int64_t n_new,
+                                bool use_flash_attn) {
     built_graph bg{};
     bg.gf = ggml_new_graph(ctx);
 
@@ -665,17 +666,28 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
         struct ggml_tensor * Q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);   // [head_dim, n_new, n_head]
         struct ggml_tensor * K = ggml_permute(ctx, K_full, 0, 2, 1, 3); // [head_dim, n_kv, n_head_kv]
 
-        struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q); // [n_kv, n_new, n_head] (GQA-broadcast)
-        KQ = ggml_soft_max_ext(ctx, KQ, bg.mask, kq_scale, 0.0f);
-
-        struct ggml_tensor * V_trans = ggml_cont_3d(ctx,
-            ggml_permute(ctx, V_full, 1, 2, 0, 3), n_kv, head_dim, hp.n_head_kv); // [n_kv, head_dim, n_head_kv]
-
-        struct ggml_tensor * KQV = ggml_mul_mat(ctx, V_trans, KQ); // [head_dim, n_new, n_head]
-        struct ggml_tensor * merged = ggml_permute(ctx, KQV, 0, 2, 1, 3); // [head_dim, n_head, n_new]
         // n_head*head_dim is the attn_output projection's *input* width, which isn't always
         // n_embd (qwen3 decouples them -- see hparams::n_embd_head)
-        cur = ggml_cont_2d(ctx, merged, hp.n_head * head_dim, n_new);
+        if (use_flash_attn) {
+            // ggml_flash_attn_ext wants: q=[head_dim,n_new,n_head] (have it), k=[head_dim,n_kv,
+            // n_head_kv] (have it), v=[head_dim,n_kv,n_head_kv] *not* transposed (unlike the
+            // manual path below), mask as F16. Result is already permuted to [head_dim,n_head,n_new].
+            struct ggml_tensor * V_flash = ggml_permute(ctx, V_full, 0, 2, 1, 3); // [head_dim, n_kv, n_head_kv]
+            struct ggml_tensor * mask_f16 = ggml_cast(ctx, bg.mask, GGML_TYPE_F16);
+            struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Q, K, V_flash, mask_f16,
+                                                                 kq_scale, 0.0f, 0.0f);
+            cur = ggml_cont_2d(ctx, attn_out, hp.n_head * head_dim, n_new);
+        } else {
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q); // [n_kv, n_new, n_head] (GQA-broadcast)
+            KQ = ggml_soft_max_ext(ctx, KQ, bg.mask, kq_scale, 0.0f);
+
+            struct ggml_tensor * V_trans = ggml_cont_3d(ctx,
+                ggml_permute(ctx, V_full, 1, 2, 0, 3), n_kv, head_dim, hp.n_head_kv); // [n_kv, head_dim, n_head_kv]
+
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx, V_trans, KQ); // [head_dim, n_new, n_head]
+            struct ggml_tensor * merged = ggml_permute(ctx, KQV, 0, 2, 1, 3); // [head_dim, n_head, n_new]
+            cur = ggml_cont_2d(ctx, merged, hp.n_head * head_dim, n_new);
+        }
 
         cur = ggml_mul_mat(ctx, l.attn_output, cur);
         cur = ggml_add(ctx, cur, residual);
@@ -695,11 +707,12 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
     return bg;
 }
 
-decode_session init_decode_session(ggml_backend_t backend) {
+decode_session init_decode_session(ggml_backend_t backend, bool use_flash_attn) {
     decode_session ds;
     size_t buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
     ds.graph_buf.resize(buf_size);
     ds.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ds.use_flash_attn = use_flash_attn;
     return ds;
 }
 
@@ -721,7 +734,7 @@ std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & 
     };
     struct ggml_context * gctx_build = ggml_init(gip);
 
-    built_graph bg = build_graph(gctx_build, m, hp, kv, n_past, n_new);
+    built_graph bg = build_graph(gctx_build, m, hp, kv, n_past, n_new, ds.use_flash_attn);
 
     // reused across calls: replans the (possibly differently-shaped) activation layout each
     // time rather than malloc/free-ing a fresh allocator every step
