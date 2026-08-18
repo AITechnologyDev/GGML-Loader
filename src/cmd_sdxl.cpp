@@ -8,14 +8,11 @@
 #include "commands.h"
 #include "model.h"
 #include "sdxl_vae.h"
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "../third_party/ggml/examples/stb_image_write.h"
+#include "sdxl_common.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -25,14 +22,18 @@
 static void print_usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s <model.gguf> [--width W] [--height H] [-o out.png] [--seed N] [--backend cpu|vulkan]\n"
-        "  W/H must be multiples of 8 (default 512x512). Decodes random noise -- not a real image;\n"
-        "  see the file header comment for what this does and doesn't prove.\n", argv0);
+        "                 [--load-latent path]\n"
+        "  W/H must be multiples of 8 (default 512x512). Decodes random noise by default -- not a\n"
+        "  real image; see the file header comment for what this does and doesn't prove. With\n"
+        "  --load-latent, decodes raw float32 latent data from a file instead (e.g. a dump from\n"
+        "  txt2img --dump-latent), for debugging a specific latent without random noise.\n", argv0);
 }
 
 int cmd_vae_decode(int argc, char ** argv) {
     std::string model_path;
     std::string out_path = "vae_test.png";
     std::string backend_name = "cpu";
+    std::string load_latent_path;
     int width = 512, height = 512;
     uint32_t seed = 0;
 
@@ -48,6 +49,8 @@ int cmd_vae_decode(int argc, char ** argv) {
             seed = (uint32_t) strtoul(argv[++i], nullptr, 10);
         } else if (a == "--backend" && i + 1 < argc) {
             backend_name = argv[++i];
+        } else if (a == "--load-latent" && i + 1 < argc) {
+            load_latent_path = argv[++i];
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -70,31 +73,25 @@ int cmd_vae_decode(int argc, char ** argv) {
 
     int64_t latent_w = width / 8, latent_h = height / 8;
     std::vector<float> latent((size_t)(latent_w * latent_h * 4));
-    std::mt19937 rng(seed != 0 ? seed : std::random_device{}());
-    std::normal_distribution<float> dist(0.0f, 1.0f);
-    for (float & v : latent) v = dist(rng);
+    if (!load_latent_path.empty()) {
+        FILE * f = fopen(load_latent_path.c_str(), "rb");
+        if (!f || fread(latent.data(), sizeof(float), latent.size(), f) != latent.size()) {
+            fprintf(stderr, "error: failed to read %zu floats from '%s'\n", latent.size(), load_latent_path.c_str());
+            return 1;
+        }
+        fclose(f);
+    } else {
+        std::mt19937 rng(seed != 0 ? seed : std::random_device{}());
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        for (float & v : latent) v = dist(rng);
+    }
 
     fprintf(stderr, "decoding %lldx%lld latent -> %dx%d image...\n",
             (long long) latent_w, (long long) latent_h, width, height);
     std::vector<float> pixels = vae_decode(vae, backend, latent, latent_w, latent_h);
     fprintf(stderr, "decode done (%zu floats)\n", pixels.size());
 
-    // ggml-native [w,h,3,1] (w fastest, c slowest) -> stb's row-major interleaved HWC uint8,
-    // rescaling the model's raw ~[-1,1] output to [0,255]
-    std::vector<uint8_t> rgb((size_t)(width * height * 3));
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            for (int c = 0; c < 3; c++) {
-                size_t src = (size_t) x + (size_t) y * width + (size_t) c * width * height;
-                float v = (pixels[src] * 0.5f + 0.5f) * 255.0f;
-                v = std::min(255.0f, std::max(0.0f, v));
-                rgb[((size_t) y * width + x) * 3 + c] = (uint8_t) v;
-            }
-        }
-    }
-
-    if (!stbi_write_png(out_path.c_str(), width, height, 3, rgb.data(), width * 3)) {
-        fprintf(stderr, "error: failed to write '%s'\n", out_path.c_str());
+    if (!sdxl_write_png(out_path, pixels, width, height)) {
         return 1;
     }
     fprintf(stderr, "wrote %s\n", out_path.c_str());

@@ -1,4 +1,5 @@
 #include "sdxl_vae.h"
+#include "sdxl_common.h"
 
 #include "ggml-alloc.h"
 
@@ -13,45 +14,36 @@ static constexpr int64_t VAE_Z_CHANNELS     = 4;
 static constexpr int64_t VAE_NUM_RES_BLOCKS = 2; // decoder uses NUM_RES_BLOCKS+1 per level
 static const int64_t VAE_CH_MULT[4] = { 1, 2, 4, 4 };
 
-static struct ggml_tensor * must_get(struct ggml_context * ctx, const std::string & name) {
-    struct ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
-    if (!t) {
-        fprintf(stderr, "error: missing VAE tensor '%s'\n", name.c_str());
-        exit(1);
-    }
-    return t;
-}
-
 static vae_resnet_block load_resnet(struct ggml_context * ctx, const std::string & p,
                                      bool has_shortcut) {
     vae_resnet_block b;
-    b.norm1_w = must_get(ctx, p + "norm1.weight");
-    b.norm1_b = must_get(ctx, p + "norm1.bias");
-    b.conv1_w = must_get(ctx, p + "conv1.weight");
-    b.conv1_b = must_get(ctx, p + "conv1.bias");
-    b.norm2_w = must_get(ctx, p + "norm2.weight");
-    b.norm2_b = must_get(ctx, p + "norm2.bias");
-    b.conv2_w = must_get(ctx, p + "conv2.weight");
-    b.conv2_b = must_get(ctx, p + "conv2.bias");
+    b.norm1_w = sdxl_must_get(ctx, p + "norm1.weight");
+    b.norm1_b = sdxl_must_get(ctx, p + "norm1.bias");
+    b.conv1_w = sdxl_must_get(ctx, p + "conv1.weight");
+    b.conv1_b = sdxl_must_get(ctx, p + "conv1.bias");
+    b.norm2_w = sdxl_must_get(ctx, p + "norm2.weight");
+    b.norm2_b = sdxl_must_get(ctx, p + "norm2.bias");
+    b.conv2_w = sdxl_must_get(ctx, p + "conv2.weight");
+    b.conv2_b = sdxl_must_get(ctx, p + "conv2.bias");
     if (has_shortcut) {
-        b.nin_shortcut_w = must_get(ctx, p + "nin_shortcut.weight");
-        b.nin_shortcut_b = must_get(ctx, p + "nin_shortcut.bias");
+        b.nin_shortcut_w = sdxl_must_get(ctx, p + "nin_shortcut.weight");
+        b.nin_shortcut_b = sdxl_must_get(ctx, p + "nin_shortcut.bias");
     }
     return b;
 }
 
 static vae_attn_block load_attn(struct ggml_context * ctx, const std::string & p) {
     vae_attn_block b;
-    b.norm_w     = must_get(ctx, p + "norm.weight");
-    b.norm_b     = must_get(ctx, p + "norm.bias");
-    b.q_w        = must_get(ctx, p + "q.weight");
-    b.q_b        = must_get(ctx, p + "q.bias");
-    b.k_w        = must_get(ctx, p + "k.weight");
-    b.k_b        = must_get(ctx, p + "k.bias");
-    b.v_w        = must_get(ctx, p + "v.weight");
-    b.v_b        = must_get(ctx, p + "v.bias");
-    b.proj_out_w = must_get(ctx, p + "proj_out.weight");
-    b.proj_out_b = must_get(ctx, p + "proj_out.bias");
+    b.norm_w     = sdxl_must_get(ctx, p + "norm.weight");
+    b.norm_b     = sdxl_must_get(ctx, p + "norm.bias");
+    b.q_w        = sdxl_must_get(ctx, p + "q.weight");
+    b.q_b        = sdxl_must_get(ctx, p + "q.bias");
+    b.k_w        = sdxl_must_get(ctx, p + "k.weight");
+    b.k_b        = sdxl_must_get(ctx, p + "k.bias");
+    b.v_w        = sdxl_must_get(ctx, p + "v.weight");
+    b.v_b        = sdxl_must_get(ctx, p + "v.bias");
+    b.proj_out_w = sdxl_must_get(ctx, p + "proj_out.weight");
+    b.proj_out_b = sdxl_must_get(ctx, p + "proj_out.bias");
     return b;
 }
 
@@ -59,8 +51,8 @@ vae_decoder load_vae_decoder(struct ggml_context * wctx) {
     vae_decoder vae;
     const std::string base = "first_stage_model.decoder.";
 
-    vae.conv_in_w = must_get(wctx, base + "conv_in.weight");
-    vae.conv_in_b = must_get(wctx, base + "conv_in.bias");
+    vae.conv_in_w = sdxl_must_get(wctx, base + "conv_in.weight");
+    vae.conv_in_b = sdxl_must_get(wctx, base + "conv_in.bias");
 
     vae.mid_block_1 = load_resnet(wctx, base + "mid.block_1.", /*has_shortcut=*/false);
     vae.mid_attn_1  = load_attn(wctx, base + "mid.attn_1.");
@@ -78,61 +70,34 @@ vae_decoder load_vae_decoder(struct ggml_context * wctx) {
         }
         if (i != 0) {
             std::string p = base + "up." + std::to_string(i) + ".upsample.";
-            lvl.upsample_conv_w = must_get(wctx, p + "conv.weight");
-            lvl.upsample_conv_b = must_get(wctx, p + "conv.bias");
+            lvl.upsample_conv_w = sdxl_must_get(wctx, p + "conv.weight");
+            lvl.upsample_conv_b = sdxl_must_get(wctx, p + "conv.bias");
         }
     }
 
-    vae.norm_out_w = must_get(wctx, base + "norm_out.weight");
-    vae.norm_out_b = must_get(wctx, base + "norm_out.bias");
-    vae.conv_out_w = must_get(wctx, base + "conv_out.weight");
-    vae.conv_out_b = must_get(wctx, base + "conv_out.bias");
+    vae.norm_out_w = sdxl_must_get(wctx, base + "norm_out.weight");
+    vae.norm_out_b = sdxl_must_get(wctx, base + "norm_out.bias");
+    vae.conv_out_w = sdxl_must_get(wctx, base + "conv_out.weight");
+    vae.conv_out_b = sdxl_must_get(wctx, base + "conv_out.bias");
 
     return vae;
 }
 
-// ---- graph building ----
-
-// stable-diffusion.cpp's gguf quantizes even tiny 1D norm/bias vectors (unlike llama.cpp-style
-// gguf, which keeps norms in F32) -- ggml_mul/ggml_add can't mix F32 with a quantized operand,
-// so every weight/bias used in an elementwise op needs this first. Cheap no-op when already F32.
-static struct ggml_tensor * to_f32(struct ggml_context * ctx, struct ggml_tensor * t) {
-    return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
-}
-
-static struct ggml_tensor * group_norm_affine(struct ggml_context * ctx, struct ggml_tensor * x,
-                                               struct ggml_tensor * w, struct ggml_tensor * b) {
-    x = ggml_group_norm(ctx, x, /*n_groups=*/32, /*eps=*/1e-6f);
-    struct ggml_tensor * w4 = ggml_reshape_4d(ctx, to_f32(ctx, w), 1, 1, w->ne[0], 1);
-    struct ggml_tensor * b4 = ggml_reshape_4d(ctx, to_f32(ctx, b), 1, 1, b->ne[0], 1);
-    x = ggml_mul(ctx, x, w4);
-    x = ggml_add(ctx, x, b4);
-    return x;
-}
-
-// s0/s1 stride, p0/p1 padding, d0/d1 dilation -- matches ggml_conv_2d's own parameter order
-static struct ggml_tensor * conv2d_bias(struct ggml_context * ctx, struct ggml_tensor * w,
-                                         struct ggml_tensor * b, struct ggml_tensor * x,
-                                         int s0, int s1, int p0, int p1, int d0, int d1) {
-    x = ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
-    struct ggml_tensor * b4 = ggml_reshape_4d(ctx, to_f32(ctx, b), 1, 1, b->ne[0], 1);
-    x = ggml_add(ctx, x, b4);
-    return x;
-}
+// ---- graph building (GroupNorm/Conv2d helpers now shared via sdxl_common.h) ----
 
 static struct ggml_tensor * resnet_fwd(struct ggml_context * ctx, const vae_resnet_block & rb,
                                         struct ggml_tensor * x) {
-    struct ggml_tensor * h = group_norm_affine(ctx, x, rb.norm1_w, rb.norm1_b);
+    struct ggml_tensor * h = sdxl_group_norm(ctx, x, rb.norm1_w, rb.norm1_b);
     h = ggml_silu(ctx, h);
-    h = conv2d_bias(ctx, rb.conv1_w, rb.conv1_b, h, 1, 1, 1, 1, 1, 1);
+    h = sdxl_conv2d(ctx, rb.conv1_w, rb.conv1_b, h, 1, 1, 1, 1, 1, 1);
 
-    h = group_norm_affine(ctx, h, rb.norm2_w, rb.norm2_b);
+    h = sdxl_group_norm(ctx, h, rb.norm2_w, rb.norm2_b);
     h = ggml_silu(ctx, h);
-    h = conv2d_bias(ctx, rb.conv2_w, rb.conv2_b, h, 1, 1, 1, 1, 1, 1);
+    h = sdxl_conv2d(ctx, rb.conv2_w, rb.conv2_b, h, 1, 1, 1, 1, 1, 1);
 
     struct ggml_tensor * residual = x;
     if (rb.nin_shortcut_w) {
-        residual = conv2d_bias(ctx, rb.nin_shortcut_w, rb.nin_shortcut_b, x, 1, 1, 0, 0, 1, 1);
+        residual = sdxl_conv2d(ctx, rb.nin_shortcut_w, rb.nin_shortcut_b, x, 1, 1, 0, 0, 1, 1);
     }
     return ggml_add(ctx, h, residual);
 }
@@ -140,7 +105,7 @@ static struct ggml_tensor * resnet_fwd(struct ggml_context * ctx, const vae_resn
 // single-head spatial self-attention over the h*w "pixels" -- see sdxl_vae.h / auto_encoder_kl.hpp
 static struct ggml_tensor * attn_fwd(struct ggml_context * ctx, const vae_attn_block & ab,
                                       struct ggml_tensor * x) {
-    struct ggml_tensor * h = group_norm_affine(ctx, x, ab.norm_w, ab.norm_b);
+    struct ggml_tensor * h = sdxl_group_norm(ctx, x, ab.norm_w, ab.norm_b);
     const int64_t w = h->ne[0], hh = h->ne[1], c = h->ne[2], n = h->ne[3];
 
     auto to_seq = [&](struct ggml_tensor * t) {
@@ -148,9 +113,9 @@ static struct ggml_tensor * attn_fwd(struct ggml_context * ctx, const vae_attn_b
         return ggml_reshape_3d(ctx, t, c, w * hh, n);          // [c, seq, n]
     };
 
-    struct ggml_tensor * q = to_seq(conv2d_bias(ctx, ab.q_w, ab.q_b, h, 1, 1, 0, 0, 1, 1));
-    struct ggml_tensor * k = to_seq(conv2d_bias(ctx, ab.k_w, ab.k_b, h, 1, 1, 0, 0, 1, 1));
-    struct ggml_tensor * v = to_seq(conv2d_bias(ctx, ab.v_w, ab.v_b, h, 1, 1, 0, 0, 1, 1));
+    struct ggml_tensor * q = to_seq(sdxl_conv2d(ctx, ab.q_w, ab.q_b, h, 1, 1, 0, 0, 1, 1));
+    struct ggml_tensor * k = to_seq(sdxl_conv2d(ctx, ab.k_w, ab.k_b, h, 1, 1, 0, 0, 1, 1));
+    struct ggml_tensor * v = to_seq(sdxl_conv2d(ctx, ab.v_w, ab.v_b, h, 1, 1, 0, 0, 1, 1));
 
     float scale = 1.0f / sqrtf((float) c);
     struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q); // [seq_k, seq_q, n]
@@ -162,19 +127,19 @@ static struct ggml_tensor * attn_fwd(struct ggml_context * ctx, const vae_attn_b
     struct ggml_tensor * out = ggml_cont(ctx, ggml_permute(ctx, kqv, 1, 0, 2, 3)); // [seq, c, n]
     out = ggml_reshape_4d(ctx, out, w, hh, c, n); // [w, h, c, n]
 
-    out = conv2d_bias(ctx, ab.proj_out_w, ab.proj_out_b, out, 1, 1, 0, 0, 1, 1);
+    out = sdxl_conv2d(ctx, ab.proj_out_w, ab.proj_out_b, out, 1, 1, 0, 0, 1, 1);
     return ggml_add(ctx, out, x);
 }
 
 static struct ggml_tensor * upsample_fwd(struct ggml_context * ctx, struct ggml_tensor * w,
                                           struct ggml_tensor * b, struct ggml_tensor * x) {
     x = ggml_upscale(ctx, x, 2, GGML_SCALE_MODE_NEAREST);
-    return conv2d_bias(ctx, w, b, x, 1, 1, 1, 1, 1, 1);
+    return sdxl_conv2d(ctx, w, b, x, 1, 1, 1, 1, 1, 1);
 }
 
 static struct ggml_tensor * vae_decode_graph(struct ggml_context * ctx, const vae_decoder & vae,
                                               struct ggml_tensor * z) {
-    struct ggml_tensor * h = conv2d_bias(ctx, vae.conv_in_w, vae.conv_in_b, z, 1, 1, 1, 1, 1, 1);
+    struct ggml_tensor * h = sdxl_conv2d(ctx, vae.conv_in_w, vae.conv_in_b, z, 1, 1, 1, 1, 1, 1);
 
     h = resnet_fwd(ctx, vae.mid_block_1, h);
     h = attn_fwd(ctx, vae.mid_attn_1, h);
@@ -190,9 +155,9 @@ static struct ggml_tensor * vae_decode_graph(struct ggml_context * ctx, const va
         }
     }
 
-    h = group_norm_affine(ctx, h, vae.norm_out_w, vae.norm_out_b);
+    h = sdxl_group_norm(ctx, h, vae.norm_out_w, vae.norm_out_b);
     h = ggml_silu(ctx, h);
-    h = conv2d_bias(ctx, vae.conv_out_w, vae.conv_out_b, h, 1, 1, 1, 1, 1, 1);
+    h = sdxl_conv2d(ctx, vae.conv_out_w, vae.conv_out_b, h, 1, 1, 1, 1, 1, 1);
     return h; // [w*8, h*8, 3, n]
 }
 

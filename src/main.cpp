@@ -5,7 +5,7 @@
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <inspect|run|chat|bench|vae-decode> [args...]\n", argv[0]);
+        fprintf(stderr, "usage: %s <inspect|run|chat|bench|vae-decode|clip-encode|txt2img> [args...]\n", argv[0]);
         return 1;
     }
 
@@ -14,9 +14,11 @@ int main(int argc, char ** argv) {
     if (cmd == "inspect") return cmd_inspect(argc - 1, argv + 1);
     if (cmd == "run")     return cmd_run(argc - 1, argv + 1);
     if (cmd == "chat")    return cmd_chat(argc - 1, argv + 1);
-    if (cmd == "bench")      return cmd_bench(argc - 1, argv + 1);
-    if (cmd == "vae-decode") return cmd_vae_decode(argc - 1, argv + 1);
+    if (cmd == "bench")       return cmd_bench(argc - 1, argv + 1);
+    if (cmd == "vae-decode")  return cmd_vae_decode(argc - 1, argv + 1);
+    if (cmd == "clip-encode") return cmd_clip_encode(argc - 1, argv + 1);
+    if (cmd == "txt2img")     return cmd_txt2img(argc - 1, argv + 1);
 
-    fprintf(stderr, "unknown subcommand '%s' (expected inspect|run|chat|bench|vae-decode)\n", cmd.c_str());
+    fprintf(stderr, "unknown subcommand '%s' (expected inspect|run|chat|bench|vae-decode|clip-encode|txt2img)\n", cmd.c_str());
     return 1;
 }

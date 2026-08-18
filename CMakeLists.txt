@@ -32,7 +32,13 @@ add_executable(ggml-loader
     src/cmd_chat.cpp
     src/cmd_bench.cpp
     src/cmd_sdxl.cpp
+    src/cmd_clip.cpp
+    src/cmd_txt2img.cpp
     src/sdxl_vae.cpp
+    src/sdxl_common.cpp
+    src/clip_tokenizer.cpp
+    src/clip_text.cpp
+    src/sdxl_unet.cpp
 )
 target_link_libraries(ggml-loader PRIVATE ggml)
 target_include_directories(ggml-loader PRIVATE src)
