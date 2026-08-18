@@ -51,6 +51,11 @@ int cmd_chat(int argc, char ** argv) {
     model   m  = load_model(wctx, hp);
     const int64_t n_vocab = m.token_embd->ne[1];
     const int32_t tok_end = turn_end_token(hp, vc);
+    // some models (observed on qwen3) occasionally emit the literal "<|endoftext|>" token mid-turn
+    // instead of the chat template's own end-of-turn token; treat it as a stop signal too if the
+    // vocab has it, rather than letting generation run past it into repetition
+    auto eot_it = vc.token_to_id.find("<|endoftext|>");
+    const int32_t tok_eot = eot_it != vc.token_to_id.end() ? eot_it->second : -1;
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(backend, 8);
@@ -98,7 +103,7 @@ int cmd_chat(int argc, char ** argv) {
         int32_t next = argmax(logits);
         int n_reply = 0;
         auto t2 = std::chrono::steady_clock::now();
-        while (n_reply < max_reply_tokens && next != tok_end && next != hp.eos_id) {
+        while (n_reply < max_reply_tokens && next != tok_end && next != hp.eos_id && next != tok_eot) {
             std::string piece = vc.detok({ next });
             fputs(piece.c_str(), stdout);
             fflush(stdout);

@@ -53,6 +53,10 @@ int cmd_run(int argc, char ** argv) {
     vocab   vc = load_vocab(gctx);
     model   m  = load_model(wctx, hp);
     const int64_t n_vocab = m.token_embd->ne[1];
+    // some models occasionally emit the literal "<|endoftext|>" token distinct from hp.eos_id;
+    // treat it as a stop signal too if the vocab has it (see cmd_chat.cpp for where this was found)
+    auto eot_it = vc.token_to_id.find("<|endoftext|>");
+    const int32_t tok_eot = eot_it != vc.token_to_id.end() ? eot_it->second : -1;
 
     std::vector<int32_t> prompt_tokens = { (int32_t) hp.bos_id };
     if (!prompt.empty()) {
@@ -77,7 +81,7 @@ int cmd_run(int argc, char ** argv) {
 
     kv_cache kv = init_kv_cache(hp, backend);
     decode_session ds = init_decode_session();
-    const int64_t head_dim = hp.n_embd / hp.n_head;
+    const int64_t head_dim = hp.n_embd_head;
     const double kv_cache_mib =
         (double)(hp.n_layer * 2 * N_CTX_MAX * hp.n_head_kv * head_dim * 2) / (1024.0 * 1024.0);
     fprintf(stderr, "KV cache: %lld ctx x %lld layers, f16 -> %.0f MiB\n",
@@ -101,7 +105,7 @@ int cmd_run(int argc, char ** argv) {
     int n_decoded = 0;
     auto t2 = std::chrono::steady_clock::now();
     for (int step = 0; step < max_new_tokens; step++) {
-        if (next == hp.eos_id) {
+        if (next == hp.eos_id || next == tok_eot) {
             fprintf(stderr, "[eos]\n");
             break;
         }

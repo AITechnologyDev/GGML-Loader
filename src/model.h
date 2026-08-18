@@ -2,13 +2,18 @@
 // chat). See model.cpp for the implementation and the design notes on scope.
 //
 // Multi-architecture support: hparams/layer_weights carry a handful of per-architecture flags
-// (qkv_fused, has_qkv_bias, ffn_fused, tied_output, has_rope_scaling) set once at load time from
+// (qkv_fused, has_qkv_bias, has_qk_norm, ffn_fused, has_rope_scaling) set once at load time from
 // `general.architecture`; build_graph()/load_model() branch on those flags at a few well-defined
-// points (QKV projection, FFN, RoPE params, output projection) rather than having one code path
-// per architecture. Currently supported: phi3 (fused QKV, fused gate+up FFN, tied output,
-// LongRoPE partial rotary) and qwen2 (separate QKV with bias, separate gate/up FFN, untied
-// output, plain full RoPE). Adding another architecture means extending load_hparams/load_model
-// and, if its chat template differs from both existing ones, append_chat_turn().
+// points (QKV projection, FFN, RoPE params) rather than having one code path per architecture.
+// Whether the output projection is tied to token_embd is NOT one of these flags -- it's decided
+// by load_model() from whether an `output.weight` tensor actually exists in the file, since that
+// varies by model *size* within an architecture (e.g. small Qwen models tie, larger ones don't),
+// not by architecture alone.
+// Currently supported: phi3 (fused QKV, fused gate+up FFN, LongRoPE partial rotary), qwen2
+// (separate QKV with bias, separate gate/up FFN, plain full RoPE), qwen3 (like qwen2 but no QKV
+// bias, adds per-head QK-Norm before RoPE, and attention width can differ from n_embd/n_head --
+// see n_embd_head). Adding another architecture means extending load_hparams/load_model and, if
+// its chat template differs from both existing ones, append_chat_turn().
 #pragma once
 
 #include "ggml.h"
@@ -30,6 +35,7 @@ constexpr int64_t N_CTX_MAX = 4096;
 enum class arch_t {
     PHI3,
     QWEN2,
+    QWEN3,
 };
 
 struct hparams {
@@ -39,9 +45,13 @@ struct hparams {
     int64_t n_embd;
     int64_t n_head;
     int64_t n_head_kv;
+    int64_t n_embd_head;    // per-head Q/K/V width. Usually n_embd/n_head, but NOT always: qwen3
+                             // decouples attention width from n_embd (attention.key_length is
+                             // explicit and can differ), so this is read from that key when
+                             // present rather than always derived.
     int64_t n_layer;
     int64_t n_ff;
-    int64_t n_rot;          // rope dimensions to rotate (== head_dim for full rotary)
+    int64_t n_rot;          // rope dimensions to rotate (== n_embd_head for full rotary)
     float   rms_eps;
     float   rope_freq_base;
 
@@ -49,10 +59,10 @@ struct hparams {
     int64_t n_ctx_orig;       // only meaningful if has_rope_scaling
     float   rope_attn_factor; // only meaningful if has_rope_scaling
 
-    bool qkv_fused;    // phi3: one attn_qkv weight. qwen2: separate attn_q/k/v.
-    bool has_qkv_bias; // qwen2: attn_q/k/v.bias present.
-    bool ffn_fused;    // phi3: one ffn_up weight holding [gate;up]. qwen2: separate ffn_gate/up.
-    bool tied_output;  // phi3: logits = token_embd^T * x. qwen2: separate output.weight.
+    bool qkv_fused;    // phi3: one attn_qkv weight. qwen2/qwen3: separate attn_q/k/v.
+    bool has_qkv_bias; // qwen2: attn_q/k/v.bias present. phi3/qwen3: no bias.
+    bool has_qk_norm;  // qwen3: attn_q_norm/attn_k_norm (RMSNorm per-head, before RoPE).
+    bool ffn_fused;    // phi3: one ffn_up weight holding [gate;up]. qwen2/qwen3: separate ffn_gate/up.
 
     int64_t bos_id;
     int64_t eos_id;
@@ -112,6 +122,10 @@ struct layer_weights {
     struct ggml_tensor * attn_k_bias  = nullptr;
     struct ggml_tensor * attn_v_bias  = nullptr;
 
+    // per-head RMSNorm applied to Q/K before RoPE -- per hparams::has_qk_norm (qwen3)
+    struct ggml_tensor * attn_q_norm = nullptr;
+    struct ggml_tensor * attn_k_norm = nullptr;
+
     struct ggml_tensor * attn_output;
     struct ggml_tensor * ffn_norm;
 
@@ -125,7 +139,7 @@ struct layer_weights {
 
 struct model {
     struct ggml_tensor * token_embd;
-    struct ggml_tensor * output;             // == token_embd if hparams::tied_output
+    struct ggml_tensor * output;             // == token_embd if no separate output.weight tensor exists
     struct ggml_tensor * output_norm;
     struct ggml_tensor * rope_factors = nullptr; // phi3 LongRoPE only; nullptr => plain RoPE
     std::vector<layer_weights> layers;

@@ -58,8 +58,9 @@ hparams load_hparams(const gguf_context * ctx) {
     h.arch_name = kv_string(ctx, "general.architecture");
     if      (h.arch_name == "phi3")  h.arch = arch_t::PHI3;
     else if (h.arch_name == "qwen2") h.arch = arch_t::QWEN2;
+    else if (h.arch_name == "qwen3") h.arch = arch_t::QWEN3;
     else {
-        fprintf(stderr, "error: unsupported architecture '%s' (supported: phi3, qwen2)\n",
+        fprintf(stderr, "error: unsupported architecture '%s' (supported: phi3, qwen2, qwen3)\n",
                 h.arch_name.c_str());
         exit(1);
     }
@@ -74,9 +75,15 @@ hparams load_hparams(const gguf_context * ctx) {
     h.rms_eps   = (float) kv_float(ctx, pfx("attention.layer_norm_rms_epsilon").c_str());
     h.rope_freq_base = (float) kv_float(ctx, pfx("rope.freq_base").c_str());
 
-    int64_t head_dim = h.n_embd / h.n_head;
+    // attention width isn't always n_embd/n_head (qwen3 decouples them); prefer the explicit
+    // key_length key when the model provides one
+    std::string key_len_key = pfx("attention.key_length");
+    h.n_embd_head = gguf_find_key(ctx, key_len_key.c_str()) >= 0
+                        ? kv_int(ctx, key_len_key.c_str())
+                        : h.n_embd / h.n_head;
+
     std::string rot_key = pfx("rope.dimension_count");
-    h.n_rot = gguf_find_key(ctx, rot_key.c_str()) >= 0 ? kv_int(ctx, rot_key.c_str()) : head_dim;
+    h.n_rot = gguf_find_key(ctx, rot_key.c_str()) >= 0 ? kv_int(ctx, rot_key.c_str()) : h.n_embd_head;
 
     std::string ctx_orig_key = pfx("rope.scaling.original_context_length");
     h.has_rope_scaling = gguf_find_key(ctx, ctx_orig_key.c_str()) >= 0;
@@ -90,8 +97,8 @@ hparams load_hparams(const gguf_context * ctx) {
 
     h.qkv_fused    = (h.arch == arch_t::PHI3);
     h.has_qkv_bias = (h.arch == arch_t::QWEN2);
+    h.has_qk_norm  = (h.arch == arch_t::QWEN3);
     h.ffn_fused    = (h.arch == arch_t::PHI3);
-    h.tied_output  = (h.arch == arch_t::PHI3);
 
     h.bos_id = kv_int(ctx, "tokenizer.ggml.bos_token_id");
     h.eos_id = kv_int(ctx, "tokenizer.ggml.eos_token_id");
@@ -354,7 +361,10 @@ model load_model(struct ggml_context * wctx, const hparams & hp) {
     model m;
     m.token_embd  = must_get(wctx, "token_embd.weight");
     m.output_norm = must_get(wctx, "output_norm.weight");
-    m.output      = hp.tied_output ? m.token_embd : must_get(wctx, "output.weight");
+    // tied vs untied output varies by model *size* within an architecture (small variants often
+    // tie, larger ones often don't), so this is decided by tensor presence, not an hparams flag
+    struct ggml_tensor * output_w = ggml_get_tensor(wctx, "output.weight");
+    m.output = output_w ? output_w : m.token_embd;
 
     if (hp.has_rope_scaling) {
         m.rope_factors = must_get(wctx, "rope_factors_short.weight"); // phi3 LongRoPE
@@ -380,6 +390,10 @@ model load_model(struct ggml_context * wctx, const hparams & hp) {
                 l.attn_k_bias = must_get(wctx, p + "attn_k.bias");
                 l.attn_v_bias = must_get(wctx, p + "attn_v.bias");
             }
+            if (hp.has_qk_norm) {
+                l.attn_q_norm = must_get(wctx, p + "attn_q_norm.weight");
+                l.attn_k_norm = must_get(wctx, p + "attn_k_norm.weight");
+            }
         }
 
         if (hp.ffn_fused) {
@@ -396,7 +410,7 @@ model load_model(struct ggml_context * wctx, const hparams & hp) {
 
 kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend) {
     kv_cache kv;
-    const int64_t head_dim = hp.n_embd / hp.n_head;
+    const int64_t head_dim = hp.n_embd_head;
 
     size_t buf_size = ggml_tensor_overhead() * (size_t)(hp.n_layer * 2 + 8);
     struct ggml_init_params ip = { buf_size, nullptr, /*.no_alloc =*/ true };
@@ -489,7 +503,7 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
     built_graph bg{};
     bg.gf = ggml_new_graph(ctx);
 
-    const int64_t head_dim = hp.n_embd / hp.n_head;
+    const int64_t head_dim = hp.n_embd_head;
     const int64_t n_kv     = n_past + n_new;
     const float   kq_scale = 1.0f / sqrtf((float) head_dim);
 
@@ -515,6 +529,13 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
         struct ggml_tensor * Kcur;
         struct ggml_tensor * Vcur;
         build_qkv(ctx, hp, l, x, n_new, head_dim, &Qcur, &Kcur, &Vcur);
+
+        if (hp.has_qk_norm) {
+            // per-head RMSNorm: rms_norm operates over ne0, which is head_dim here, so this
+            // normalizes each (head, token) vector independently -- exactly qwen3's QK-Norm
+            Qcur = rms_norm_mul(ctx, Qcur, l.attn_q_norm, hp.rms_eps);
+            Kcur = rms_norm_mul(ctx, Kcur, l.attn_k_norm, hp.rms_eps);
+        }
 
         Qcur = ggml_rope_ext(ctx, Qcur, bg.positions, m.rope_factors,
                               (int) hp.n_rot, GGML_ROPE_TYPE_NEOX, (int) hp.n_ctx_orig,
@@ -551,7 +572,9 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
 
         struct ggml_tensor * KQV = ggml_mul_mat(ctx, V_trans, KQ); // [head_dim, n_new, n_head]
         struct ggml_tensor * merged = ggml_permute(ctx, KQV, 0, 2, 1, 3); // [head_dim, n_head, n_new]
-        cur = ggml_cont_2d(ctx, merged, hp.n_embd, n_new);
+        // n_head*head_dim is the attn_output projection's *input* width, which isn't always
+        // n_embd (qwen3 decouples them -- see hparams::n_embd_head)
+        cur = ggml_cont_2d(ctx, merged, hp.n_head * head_dim, n_new);
 
         cur = ggml_mul_mat(ctx, l.attn_output, cur);
         cur = ggml_add(ctx, cur, residual);
