@@ -33,6 +33,7 @@ add_executable(ggml-loader
     src/cmd_bench.cpp
     src/cmd_sdxl.cpp
     src/cmd_clip.cpp
+    src/cmd_unet.cpp
     src/cmd_txt2img.cpp
     src/sdxl_vae.cpp
     src/sdxl_common.cpp

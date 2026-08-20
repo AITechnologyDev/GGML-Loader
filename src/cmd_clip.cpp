@@ -9,6 +9,7 @@
 #include "clip_tokenizer.h"
 #include "clip_text.h"
 #include "model.h"
+#include "sdxl_common.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -20,38 +21,42 @@
 #include <vector>
 
 static void print_usage(const char * argv0) {
-    fprintf(stderr, "usage: %s <model.gguf> \"prompt\" [--backend cpu|vulkan]\n", argv0);
-}
-
-static void print_stats(const char * name, const std::vector<float> & v) {
-    float vmin = v[0], vmax = v[0], sum = 0.0f;
-    int n_nan = 0, n_inf = 0;
-    for (float x : v) {
-        if (std::isnan(x)) { n_nan++; continue; }
-        if (std::isinf(x)) { n_inf++; continue; }
-        vmin = std::min(vmin, x);
-        vmax = std::max(vmax, x);
-        sum += x;
-    }
-    fprintf(stderr, "%s: n=%zu mean=%.4f min=%.4f max=%.4f nan=%d inf=%d\n",
-            name, v.size(), sum / v.size(), vmin, vmax, n_nan, n_inf);
+    fprintf(stderr,
+        "usage: %s <model.gguf> \"prompt\" [--backend cpu|vulkan] [--dump-context path]\n"
+        "  --dump-context writes context[2048,77]+pooled[1280] to a file for a separate\n"
+        "  `unet-denoise` process to consume (see sdxl_save_condition) -- lets CLIP's weights be\n"
+        "  freed before the U-Net's are loaded, part of the staged encoder/UNet/decoder pipeline.\n",
+        argv0);
 }
 
 int cmd_clip_encode(int argc, char ** argv) {
     std::string model_path, prompt;
     std::string backend_name = "cpu";
+    std::string dump_context_path;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--backend" && i + 1 < argc) {
+        if ((a == "-p" || a == "--prompt") && i + 1 < argc) {
+            prompt = argv[++i];
+        } else if (a == "--backend" && i + 1 < argc) {
             backend_name = argv[++i];
+        } else if (a == "--dump-context" && i + 1 < argc) {
+            dump_context_path = argv[++i];
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return 0;
+        } else if (!a.empty() && a[0] == '-') {
+            fprintf(stderr, "error: unrecognized flag '%s'\n", a.c_str());
+            print_usage(argv[0]);
+            return 1;
         } else if (model_path.empty()) {
             model_path = a;
         } else if (prompt.empty()) {
             prompt = a;
+        } else {
+            fprintf(stderr, "error: unexpected extra argument '%s'\n", a.c_str());
+            print_usage(argv[0]);
+            return 1;
         }
     }
     if (model_path.empty() || prompt.empty()) {
@@ -62,7 +67,9 @@ int cmd_clip_encode(int argc, char ** argv) {
     ggml_backend_t backend = init_backend(backend_name, 8);
 
     struct gguf_context * gctx = nullptr;
-    weights_store ws = load_weights(model_path.c_str(), backend, &gctx);
+    // filtered to just the two CLIP text-tower's tensors ("cond_stage_model." and
+    // "cond_stage_model.1.") -- part of the staged pipeline, see --dump-context above.
+    weights_store ws = load_weights_filtered(model_path.c_str(), backend, {"cond_stage_model."}, &gctx);
 
     clip_text_model clip_l = load_clip_text(ws.ctx, "cond_stage_model.transformer.text_model.",
                                              /*n_layer=*/12, /*hidden=*/768, /*n_head=*/12,
@@ -79,8 +86,15 @@ int cmd_clip_encode(int argc, char ** argv) {
     fprintf(stderr, ")\n");
 
     sdxl_text_condition cond = clip_encode(clip_l, clip_g, backend, ids);
-    print_stats("context[2048,77]", cond.context);
-    print_stats("pooled[1280]", cond.pooled);
+    sdxl_print_stats("context[2048,77]", cond.context);
+    sdxl_print_stats("pooled[1280]", cond.pooled);
+
+    if (!dump_context_path.empty()) {
+        if (!sdxl_save_condition(dump_context_path, cond.context, cond.pooled)) {
+            return 1;
+        }
+        fprintf(stderr, "dumped text conditioning to %s\n", dump_context_path.c_str());
+    }
 
     ggml_backend_buffer_free(ws.buffer);
     ggml_free(ws.ctx);

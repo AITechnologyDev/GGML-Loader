@@ -3,10 +3,12 @@
 
 #include "ggml-alloc.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 // standard SD1.x/SDXL VAE config -- see file header in sdxl_vae.h
 static constexpr int64_t VAE_CH             = 128;
@@ -138,24 +140,42 @@ static struct ggml_tensor * upsample_fwd(struct ggml_context * ctx, struct ggml_
 }
 
 static struct ggml_tensor * vae_decode_graph(struct ggml_context * ctx, const vae_decoder & vae,
-                                              struct ggml_tensor * z) {
+                                              struct ggml_tensor * z,
+                                              std::vector<std::pair<std::string, struct ggml_tensor *>> * checkpoints = nullptr) {
+    auto mark = [&](const char * name, struct ggml_tensor * t) {
+        if (checkpoints) {
+            ggml_set_output(t); // protect from ggml_gallocr's buffer-reuse planning -- without this
+                                 // a checkpoint's memory can legitimately get overwritten by a later
+                                 // tensor before we read it back post-compute (bit us once already)
+            checkpoints->push_back({name, t});
+        }
+    };
+
     struct ggml_tensor * h = sdxl_conv2d(ctx, vae.conv_in_w, vae.conv_in_b, z, 1, 1, 1, 1, 1, 1);
+    mark("conv_in", h);
 
     h = resnet_fwd(ctx, vae.mid_block_1, h);
+    mark("mid_block_1", h);
     h = attn_fwd(ctx, vae.mid_attn_1, h);
+    mark("mid_attn_1", h);
     h = resnet_fwd(ctx, vae.mid_block_2, h);
+    mark("mid_block_2", h);
 
     for (int i = 3; i >= 0; i--) {
         const vae_up_level & lvl = vae.up[i];
+        int j = 0;
         for (const vae_resnet_block & rb : lvl.blocks) {
             h = resnet_fwd(ctx, rb, h);
+            mark(("up_" + std::to_string(i) + "_block_" + std::to_string(j++)).c_str(), h);
         }
         if (lvl.upsample_conv_w) {
             h = upsample_fwd(ctx, lvl.upsample_conv_w, lvl.upsample_conv_b, h);
+            mark(("up_" + std::to_string(i) + "_upsample").c_str(), h);
         }
     }
 
     h = sdxl_group_norm(ctx, h, vae.norm_out_w, vae.norm_out_b);
+    mark("norm_out", h);
     h = ggml_silu(ctx, h);
     h = sdxl_conv2d(ctx, vae.conv_out_w, vae.conv_out_b, h, 1, 1, 1, 1, 1, 1);
     return h; // [w*8, h*8, 3, n]
@@ -175,7 +195,9 @@ std::vector<float> vae_decode(const vae_decoder & vae, ggml_backend_t backend,
 
     struct ggml_tensor * z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, latent_w, latent_h,
                                                  VAE_Z_CHANNELS, 1);
-    struct ggml_tensor * out = vae_decode_graph(ctx, vae, z);
+    bool debug = getenv("SDXL_VAE_DEBUG") != nullptr;
+    std::vector<std::pair<std::string, struct ggml_tensor *>> checkpoints;
+    struct ggml_tensor * out = vae_decode_graph(ctx, vae, z, debug ? &checkpoints : nullptr);
     ggml_build_forward_expand(gf, out);
 
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -186,6 +208,23 @@ std::vector<float> vae_decode(const vae_decoder & vae, ggml_backend_t backend,
 
     ggml_backend_tensor_set(z, latent_data.data(), 0, latent_data.size() * sizeof(float));
     ggml_backend_graph_compute(backend, gf);
+
+    if (debug) {
+        for (auto & [name, t] : checkpoints) {
+            std::vector<float> v(ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+            float vmin = v[0], vmax = v[0], sum = 0.0f;
+            int n_nan = 0;
+            for (float x : v) {
+                if (std::isnan(x)) { n_nan++; continue; }
+                vmin = std::min(vmin, x);
+                vmax = std::max(vmax, x);
+                sum += x;
+            }
+            fprintf(stderr, "  [vae] %-16s n=%-8zu mean=%.4f min=%.4f max=%.4f nan=%d\n",
+                    name.c_str(), v.size(), sum / v.size(), vmin, vmax, n_nan);
+        }
+    }
 
     std::vector<float> result(ggml_nelements(out));
     ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));

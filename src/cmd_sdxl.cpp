@@ -67,7 +67,10 @@ int cmd_vae_decode(int argc, char ** argv) {
     ggml_backend_t backend = init_backend(backend_name, 8);
 
     struct gguf_context * gctx = nullptr;
-    weights_store ws = load_weights(model_path.c_str(), backend, &gctx);
+    // filtered to just the VAE decoder's tensors -- part of the staged encoder/UNet/decoder
+    // pipeline (each stage its own process) so this process's peak memory is bounded by the VAE
+    // alone, not the whole checkpoint (CLIP+UNet+VAE), letting 512x512 run without OOM.
+    weights_store ws = load_weights_filtered(model_path.c_str(), backend, {"first_stage_model.decoder."}, &gctx);
     vae_decoder vae = load_vae_decoder(ws.ctx);
     fprintf(stderr, "VAE decoder loaded (backend=%s)\n", backend_name.c_str());
 

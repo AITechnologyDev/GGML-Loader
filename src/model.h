@@ -169,6 +169,16 @@ struct weights_store {
 };
 weights_store load_weights(const char * path, ggml_backend_t backend, struct gguf_context ** out_gguf);
 
+// Same as load_weights(), but only allocates/reads tensors whose name starts with one of
+// `prefixes` -- everything else in the file is skipped entirely (never allocated in the backend
+// buffer, never read off disk). Lets a process that only needs e.g. the SDXL VAE decoder avoid
+// paying for CLIP+UNet's memory too, so a staged encoder/UNet/decoder pipeline run as separate
+// process invocations actually lowers peak memory instead of each stage loading the whole
+// checkpoint anyway. An empty `prefixes` matches everything (same behavior as load_weights()).
+weights_store load_weights_filtered(const char * path, ggml_backend_t backend,
+                                     const std::vector<std::string> & prefixes,
+                                     struct gguf_context ** out_gguf);
+
 // Selects a backend by name ("cpu" or "vulkan"). Exits with an error on an unknown name or if
 // vulkan is requested but this build/device doesn't have it. n_threads only affects "cpu".
 ggml_backend_t init_backend(const std::string & name, int n_threads);

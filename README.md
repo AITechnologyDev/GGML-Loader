@@ -37,11 +37,25 @@ Mali-specific GPU backend -- this project's actual reason to exist -- still hasn
 Verified against Phi-4-mini-instruct, Qwen2.5-Coder-7B, Qwen3-0.6B, and Llama-3.1-8B-Instruct,
 all Q4_K_M/Q8_0 quantized.
 
+### SDXL / image diffusion -- beta, CPU-only, not the project's focus
+
+A basic SDXL Turbo text-to-image path exists (`clip-encode`, `unet-denoise`, `vae-decode`, and
+`txt2img` which chains all three): dual CLIP text encoder, the full U-Net, VAE decoder, and a
+single-step Euler sampler (SDXL Turbo's native 1-step mode -- no CFG, no negative prompt, no
+multi-step schedule). `txt2img` loads and frees each stage's weights in turn rather than holding
+CLIP+UNet+VAE resident all at once, which is what keeps 512x512 from OOMing on-device.
+
+This was built as a side track to prove the loader could drive something other than a text LLM,
+not because SDXL is this project's actual goal (that's still the Mali GPU backend, see below/
+"Findings"). It's CPU-only, single-step-Turbo-only, and not expected to see much further
+investment -- no multi-step sampler, no CFG/negative prompts, no other SDXL-family architectures
+(e.g. base SDXL checkpoints need real multi-step + CFG support to produce anything but noise
+through this path today), no Vulkan port planned for it specifically.
+
 ## What's NOT here yet
 
 - **A Mali-specific GPU backend.** This is the actual point of the project and hasn't been
   started. See "Findings" for why it's needed rather than just using ggml's existing backends.
-- SDXL / image diffusion support.
 - Other architectures the user has test models for but that turned out to be much bigger
   undertakings than "add a few flags": **qwen35** (Qwen3.5+, a hybrid Gated DeltaNet + MoE +
   vision-language architecture -- new op types we don't have at all), **nemotron_h** (NVIDIA's

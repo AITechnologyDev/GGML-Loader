@@ -443,7 +443,9 @@ model load_model(struct ggml_context * wctx, const hparams & hp) {
     return m;
 }
 
-weights_store load_weights(const char * path, ggml_backend_t backend, struct gguf_context ** out_gguf) {
+weights_store load_weights_filtered(const char * path, ggml_backend_t backend,
+                                     const std::vector<std::string> & prefixes,
+                                     struct gguf_context ** out_gguf) {
     struct ggml_context * meta_ctx = nullptr;
     struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta_ctx };
     struct gguf_context * gctx = gguf_init_from_file(path, gp);
@@ -452,9 +454,42 @@ weights_store load_weights(const char * path, ggml_backend_t backend, struct ggu
         exit(1);
     }
 
+    int64_t n_tensors = gguf_get_n_tensors(gctx);
+    auto wanted = [&](const std::string & name) {
+        if (prefixes.empty()) return true;
+        for (const std::string & p : prefixes) {
+            if (name.compare(0, p.size(), p) == 0) return true;
+        }
+        return false;
+    };
+
+    // meta_ctx (no_alloc) holds descriptors for every tensor in the file; ggml has no API to strip
+    // unwanted ones out of it, and ggml_backend_alloc_ctx_tensors() always allocates for the whole
+    // context. So build a second, smaller context containing only the tensors we actually want,
+    // and allocate/read from that instead -- meta_ctx is freed right after, only used to discover
+    // names/shapes and (via gctx) file offsets.
+    int64_t n_wanted = 0;
+    for (int64_t i = 0; i < n_tensors; i++) {
+        if (wanted(gguf_get_tensor_name(gctx, i))) n_wanted++;
+    }
+    struct ggml_init_params ip = {
+        /*.mem_size   =*/ n_wanted * ggml_tensor_overhead() + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * wctx = ggml_init(ip);
+
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gctx, i);
+        if (!wanted(name)) continue;
+        struct ggml_tensor * src = ggml_get_tensor(meta_ctx, name);
+        struct ggml_tensor * t = ggml_dup_tensor(wctx, src);
+        ggml_set_name(t, name);
+    }
+
     weights_store ws;
-    ws.ctx = meta_ctx;
-    ws.buffer = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
+    ws.ctx = wctx;
+    ws.buffer = ggml_backend_alloc_ctx_tensors(wctx, backend);
     if (!ws.buffer) {
         fprintf(stderr, "error: failed to allocate backend memory for weights from '%s'\n", path);
         exit(1);
@@ -466,11 +501,11 @@ weights_store load_weights(const char * path, ggml_backend_t backend, struct ggu
         exit(1);
     }
     size_t data_base = gguf_get_data_offset(gctx);
-    int64_t n_tensors = gguf_get_n_tensors(gctx);
     std::vector<uint8_t> buf;
     for (int64_t i = 0; i < n_tensors; i++) {
         const char * name = gguf_get_tensor_name(gctx, i);
-        struct ggml_tensor * t = ggml_get_tensor(meta_ctx, name);
+        if (!wanted(name)) continue;
+        struct ggml_tensor * t = ggml_get_tensor(wctx, name);
         size_t size = ggml_nbytes(t);
         size_t offset = data_base + gguf_get_tensor_offset(gctx, i);
         buf.resize(size);
@@ -483,7 +518,12 @@ weights_store load_weights(const char * path, ggml_backend_t backend, struct ggu
     fclose(f);
 
     *out_gguf = gctx;
+    ggml_free(meta_ctx);
     return ws;
+}
+
+weights_store load_weights(const char * path, ggml_backend_t backend, struct gguf_context ** out_gguf) {
+    return load_weights_filtered(path, backend, {}, out_gguf);
 }
 
 ggml_backend_t init_backend(const std::string & name, int n_threads) {

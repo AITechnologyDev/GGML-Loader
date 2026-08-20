@@ -56,3 +56,26 @@ struct ggml_tensor * sdxl_attention(struct ggml_context * ctx, struct ggml_tenso
 // [0,255] and transposes to stb_image_write's row-major interleaved HWC before writing. Returns
 // false (and prints an error) on write failure.
 bool sdxl_write_png(const std::string & path, const std::vector<float> & pixels, int width, int height);
+
+// sigma at t=999 under the standard SD/SDXL noise schedule (beta_start=0.00085, beta_end=0.012,
+// scaled-linear, 1000 steps) -- see cmd_txt2img.cpp's fuller derivation comment. Shared so a
+// staged unet-denoise process uses exactly the same constant as the monolithic txt2img path.
+float sdxl_sigma_max();
+
+// SDXL's 2816-dim micro-conditioning vector: pooled text embedding [1280] + sinusoidal embeddings
+// of (original_size, crop_top_left, target_size). We don't support cropping/aspect tricks, so crop
+// is always (0,0) and original_size==target_size==the actual output size (see
+// cmd_txt2img.cpp's fuller comment).
+std::vector<float> sdxl_micro_conditioning(const std::vector<float> & pooled, int height, int width);
+
+// n/mean/min/max/nan diagnostic print, shared across every SDXL subcommand's debug/verification output.
+void sdxl_print_stats(const char * name, const std::vector<float> & v);
+
+// Serializes text conditioning (context[2048*77] + pooled[1280]) to a small self-describing binary
+// file (two int64 sizes, then the raw floats), so `clip-encode` can run as its own process and hand
+// off to a separate `unet-denoise` process without both needing CLIP+UNet loaded simultaneously at
+// once (see load_weights_filtered() in model.h). Returns false (and prints an error) on failure.
+bool sdxl_save_condition(const std::string & path, const std::vector<float> & context,
+                          const std::vector<float> & pooled);
+bool sdxl_load_condition(const std::string & path, std::vector<float> & context,
+                          std::vector<float> & pooled);
