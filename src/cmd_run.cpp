@@ -76,7 +76,8 @@ int cmd_run(int argc, char ** argv) {
     auto eot_it = vc.token_to_id.find("<|endoftext|>");
     const int32_t tok_eot = eot_it != vc.token_to_id.end() ? eot_it->second : -1;
 
-    std::vector<int32_t> prompt_tokens = { (int32_t) hp.bos_id };
+    std::vector<int32_t> prompt_tokens;
+    if (hp.bos_id >= 0) prompt_tokens.push_back((int32_t) hp.bos_id); // some tokenizers have none
     if (!prompt.empty()) {
         std::vector<int32_t> enc = vc.encode(prompt);
         prompt_tokens.insert(prompt_tokens.end(), enc.begin(), enc.end());

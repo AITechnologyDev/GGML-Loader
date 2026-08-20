@@ -95,7 +95,8 @@ int cmd_chat(int argc, char ** argv) {
             model_path.c_str(), hp.arch_name.c_str(), (long long) hp.n_layer, backend_name.c_str(),
             hp.supports_thinking ? (enable_thinking ? ", thinking=on" : ", thinking=off") : "");
 
-    std::vector<int32_t> pending = { (int32_t) hp.bos_id };
+    std::vector<int32_t> pending;
+    if (hp.bos_id >= 0) pending.push_back((int32_t) hp.bos_id); // some tokenizers have none
     if (!system_prompt.empty()) {
         append_chat_turn(hp, vc, pending, "system", system_prompt);
     }

@@ -42,6 +42,7 @@ enum class arch_t {
     QWEN3,
     LLAMA,
     NEMOTRON_H,
+    QWEN35,
 };
 
 // nemotron_h only: which mixer a block uses. Derived from two per-layer gguf arrays
@@ -109,6 +110,31 @@ struct hparams {
         if (n_ff_layer[il] != 0) return layer_kind_t::FFN;
         if (n_head_kv_layer[il] != 0) return layer_kind_t::ATTN;
         return layer_kind_t::SSM;
+    }
+
+    // qwen35 only: unlike nemotron_h's per-layer arrays, this arch's mixer choice is a fixed
+    // interval rule read straight off its own gguf key (qwen35.full_attention_interval, this
+    // checkpoint: 4) -- every block still has both a mixer AND an FFN (normal transformer
+    // structure, unlike nemotron_h's single-mixer-per-block), only the mixer choice varies.
+    // Confirmed against llama.cpp upstream's own fallback rule when no per-layer override array
+    // is present (this gguf has none): layer il (0-indexed) is full attention iff (il+1) is a
+    // multiple of the interval, otherwise it's the Gated DeltaNet linear-attention mixer.
+    int64_t full_attention_interval = 0; // 0 => not applicable (every arch except qwen35)
+    int64_t dn_n_head    = 0; // Gated DeltaNet head count (qwen35.ssm.group_count)
+    int64_t dn_head_dim  = 0; // per-head width, q/k/v and the square recurrent state
+                               // (qwen35.ssm.state_size -- confirmed via this checkpoint's own
+                               // attn_qkv output width: 3 * dn_n_head * dn_head_dim == 6144 exactly)
+    int64_t dn_d_conv    = 0; // causal conv1d kernel width (qwen35.ssm.conv_kernel)
+
+    bool is_deltanet_layer(int64_t il) const {
+        if (arch != arch_t::QWEN35 || full_attention_interval <= 0) return false;
+        if (il == n_layer - 1) return false; // the last layer is always forced to full attention
+                                              // (confirmed via this checkpoint's own tensor
+                                              // presence: layer 24/25 breaks the plain modulo rule
+                                              // that otherwise holds for every earlier layer) --
+                                              // a known hybrid-architecture pattern (full context
+                                              // mixing right before the output projection).
+        return (il + 1) % full_attention_interval != 0;
     }
 
     int64_t bos_id;
@@ -211,6 +237,16 @@ struct layer_weights {
     struct ggml_tensor * ssm_d        = nullptr; // [1, n_head] skip-connection scale
     struct ggml_tensor * ssm_norm     = nullptr; // [d_inner/n_group, n_group] grouped RMSNorm weight
     struct ggml_tensor * ssm_out      = nullptr; // [d_inner, n_embd]
+
+    // qwen35 Gated DeltaNet mixer (linear-attention layers only, see hparams::is_deltanet_layer).
+    // Reuses attn_qkv above for the fused q/k/v in-projection (3*dn_n_head*dn_head_dim wide) and
+    // ssm_conv1d_w/ssm_dt_b/ssm_a/ssm_norm/ssm_out above for their same roles as nemotron_h's
+    // Mamba2 mixer -- ssm_conv1d_b stays null here (this arch's conv1d has no bias tensor at all,
+    // confirmed via inspect, not an omission). attn_gate below is this arch-specific: a dedicated
+    // output-gate projection (nemotron_h instead derives its z-gate from within ssm_in's own split).
+    struct ggml_tensor * ssm_alpha = nullptr; // [n_embd, dn_n_head] -> decay gate pre-activation
+    struct ggml_tensor * ssm_beta  = nullptr; // [n_embd, dn_n_head] -> mixing-rate gate pre-activation
+    struct ggml_tensor * attn_gate = nullptr; // [n_embd, n_embd] output gate (qwen35 delta-net only)
 };
 
 struct model {
