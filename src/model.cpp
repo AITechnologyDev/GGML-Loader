@@ -58,54 +58,99 @@ static std::string kv_string(const gguf_context * ctx, const char * key) {
     return gguf_get_val_str(ctx, id);
 }
 
+// nemotron_h's per-layer head_count_kv/feed_forward_length are gguf INT32 arrays, not scalars --
+// this is what actually encodes each block's layer_kind_t (see model.h).
+static std::vector<int64_t> kv_int_arr(const gguf_context * ctx, const char * key) {
+    int64_t id = kv_find(ctx, key);
+    if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(ctx, id) != GGUF_TYPE_INT32) {
+        fprintf(stderr, "error: key '%s' is not an int32 array\n", key);
+        exit(1);
+    }
+    size_t n = gguf_get_arr_n(ctx, id);
+    const int32_t * data = (const int32_t *) gguf_get_arr_data(ctx, id);
+    return std::vector<int64_t>(data, data + n);
+}
+
 hparams load_hparams(const gguf_context * ctx) {
     hparams h{};
     h.arch_name = kv_string(ctx, "general.architecture");
-    if      (h.arch_name == "phi3")  h.arch = arch_t::PHI3;
-    else if (h.arch_name == "qwen2") h.arch = arch_t::QWEN2;
-    else if (h.arch_name == "qwen3") h.arch = arch_t::QWEN3;
-    else if (h.arch_name == "llama") h.arch = arch_t::LLAMA;
+    if      (h.arch_name == "phi3")       h.arch = arch_t::PHI3;
+    else if (h.arch_name == "qwen2")      h.arch = arch_t::QWEN2;
+    else if (h.arch_name == "qwen3")      h.arch = arch_t::QWEN3;
+    else if (h.arch_name == "llama")      h.arch = arch_t::LLAMA;
+    else if (h.arch_name == "nemotron_h") h.arch = arch_t::NEMOTRON_H;
     else {
-        fprintf(stderr, "error: unsupported architecture '%s' (supported: phi3, qwen2, qwen3, llama)\n",
-                h.arch_name.c_str());
+        fprintf(stderr, "error: unsupported architecture '%s' "
+                         "(supported: phi3, qwen2, qwen3, llama, nemotron_h)\n", h.arch_name.c_str());
         exit(1);
     }
 
     auto pfx = [&](const char * suffix) { return h.arch_name + "." + suffix; };
 
-    h.n_embd    = kv_int(ctx, pfx("embedding_length").c_str());
-    h.n_head    = kv_int(ctx, pfx("attention.head_count").c_str());
-    h.n_head_kv = kv_int(ctx, pfx("attention.head_count_kv").c_str());
-    h.n_layer   = kv_int(ctx, pfx("block_count").c_str());
-    h.n_ff      = kv_int(ctx, pfx("feed_forward_length").c_str());
-    h.rms_eps   = (float) kv_float(ctx, pfx("attention.layer_norm_rms_epsilon").c_str());
-    h.rope_freq_base = (float) kv_float(ctx, pfx("rope.freq_base").c_str());
+    h.n_embd  = kv_int(ctx, pfx("embedding_length").c_str());
+    h.n_head  = kv_int(ctx, pfx("attention.head_count").c_str());
+    h.n_layer = kv_int(ctx, pfx("block_count").c_str());
+    h.rms_eps = (float) kv_float(ctx, pfx("attention.layer_norm_rms_epsilon").c_str());
 
-    // attention width isn't always n_embd/n_head (qwen3 decouples them); prefer the explicit
-    // key_length key when the model provides one
-    std::string key_len_key = pfx("attention.key_length");
-    h.n_embd_head = gguf_find_key(ctx, key_len_key.c_str()) >= 0
-                        ? kv_int(ctx, key_len_key.c_str())
-                        : h.n_embd / h.n_head;
-
-    std::string rot_key = pfx("rope.dimension_count");
-    h.n_rot = gguf_find_key(ctx, rot_key.c_str()) >= 0 ? kv_int(ctx, rot_key.c_str()) : h.n_embd_head;
-
-    std::string ctx_orig_key = pfx("rope.scaling.original_context_length");
-    h.has_rope_scaling = gguf_find_key(ctx, ctx_orig_key.c_str()) >= 0;
-    if (h.has_rope_scaling) {
-        h.n_ctx_orig       = kv_int(ctx, ctx_orig_key.c_str());
-        h.rope_attn_factor = (float) kv_float(ctx, pfx("rope.scaling.attn_factor").c_str());
-    } else {
-        h.n_ctx_orig       = kv_int(ctx, pfx("context_length").c_str()); // unused when ext_factor=0
+    if (h.arch == arch_t::NEMOTRON_H) {
+        // no rope.freq_base key at all in this arch's gguf (see hparams::no_rope) -- every other
+        // scalar key that the generic path below reads unconditionally (rope.freq_base,
+        // attention.head_count_kv, feed_forward_length) is either absent or an array here, so this
+        // arch gets its own branch rather than trying to force it through the shared path.
+        h.no_rope         = true;
+        h.n_head_kv_layer  = kv_int_arr(ctx, pfx("attention.head_count_kv").c_str());
+        h.n_ff_layer       = kv_int_arr(ctx, pfx("feed_forward_length").c_str());
+        std::string key_len_key = pfx("attention.key_length");
+        h.n_embd_head = gguf_find_key(ctx, key_len_key.c_str()) >= 0
+                            ? kv_int(ctx, key_len_key.c_str()) : h.n_embd / h.n_head;
+        h.n_rot = h.n_embd_head; // unused: no_rope is true, RoPE is never applied for this arch
+        h.n_head_kv = 1; // scalar unused by nemotron_h's own code path; kept nonzero so any
+                          // generic-path code that might still read it (e.g. a future shared
+                          // helper) doesn't divide by zero or size a 0-dim tensor
+        h.has_rope_scaling = false;
+        h.n_ctx_orig       = kv_int(ctx, pfx("context_length").c_str());
         h.rope_attn_factor = 1.0f;
-    }
+        h.rope_freq_base   = 10000.0f; // unused (no_rope=true), just a harmless default
 
-    h.qkv_fused    = (h.arch == arch_t::PHI3);
-    h.has_qkv_bias = (h.arch == arch_t::QWEN2);
-    h.has_qk_norm  = (h.arch == arch_t::QWEN3);
-    h.ffn_fused    = (h.arch == arch_t::PHI3);
-    h.rope_neox    = (h.arch != arch_t::LLAMA); // llama uses "normal" interleaved-pairs rotation
+        h.ssm_d_state = kv_int(ctx, pfx("ssm.state_size").c_str());
+        h.ssm_d_conv  = kv_int(ctx, pfx("ssm.conv_kernel").c_str());
+        h.ssm_n_group = kv_int(ctx, pfx("ssm.group_count").c_str());
+        h.ssm_d_inner = kv_int(ctx, pfx("ssm.inner_size").c_str());
+        h.ssm_n_head  = kv_int(ctx, pfx("ssm.time_step_rank").c_str()); // see hparams.ssm_n_head's comment
+
+        h.qkv_fused = h.has_qkv_bias = h.has_qk_norm = h.ffn_fused = false; // unused by this arch
+        h.n_ff = 0; // unused (per-layer n_ff_layer is what matters); load_model doesn't read this scalar for nemotron_h
+    } else {
+        h.n_head_kv = kv_int(ctx, pfx("attention.head_count_kv").c_str());
+        h.n_ff      = kv_int(ctx, pfx("feed_forward_length").c_str());
+        h.rope_freq_base = (float) kv_float(ctx, pfx("rope.freq_base").c_str());
+
+        // attention width isn't always n_embd/n_head (qwen3 decouples them); prefer the explicit
+        // key_length key when the model provides one
+        std::string key_len_key = pfx("attention.key_length");
+        h.n_embd_head = gguf_find_key(ctx, key_len_key.c_str()) >= 0
+                            ? kv_int(ctx, key_len_key.c_str())
+                            : h.n_embd / h.n_head;
+
+        std::string rot_key = pfx("rope.dimension_count");
+        h.n_rot = gguf_find_key(ctx, rot_key.c_str()) >= 0 ? kv_int(ctx, rot_key.c_str()) : h.n_embd_head;
+
+        std::string ctx_orig_key = pfx("rope.scaling.original_context_length");
+        h.has_rope_scaling = gguf_find_key(ctx, ctx_orig_key.c_str()) >= 0;
+        if (h.has_rope_scaling) {
+            h.n_ctx_orig       = kv_int(ctx, ctx_orig_key.c_str());
+            h.rope_attn_factor = (float) kv_float(ctx, pfx("rope.scaling.attn_factor").c_str());
+        } else {
+            h.n_ctx_orig       = kv_int(ctx, pfx("context_length").c_str()); // unused when ext_factor=0
+            h.rope_attn_factor = 1.0f;
+        }
+
+        h.qkv_fused    = (h.arch == arch_t::PHI3);
+        h.has_qkv_bias = (h.arch == arch_t::QWEN2);
+        h.has_qk_norm  = (h.arch == arch_t::QWEN3);
+        h.ffn_fused    = (h.arch == arch_t::PHI3);
+        h.rope_neox    = (h.arch != arch_t::LLAMA); // llama uses "normal" interleaved-pairs rotation
+    }
 
     h.bos_id = kv_int(ctx, "tokenizer.ggml.bos_token_id");
     h.eos_id = kv_int(ctx, "tokenizer.ggml.eos_token_id");
@@ -408,6 +453,41 @@ model load_model(struct ggml_context * wctx, const hparams & hp) {
     }
 
     m.layers.resize(hp.n_layer);
+
+    if (hp.arch == arch_t::NEMOTRON_H) {
+        // one mixer per block (attn XOR ssm XOR ffn, never combined -- see layer_kind_t), and a
+        // single pre-mixer norm (attn_norm) rather than the usual two-norm attn+ffn pair -- this
+        // gguf genuinely has no ffn_norm tensor at all, confirmed via inspect, not an oversight.
+        for (int64_t il = 0; il < hp.n_layer; il++) {
+            std::string p = "blk." + std::to_string(il) + ".";
+            layer_weights & l = m.layers[il];
+            l.attn_norm = must_get(wctx, p + "attn_norm.weight");
+            switch (hp.layer_kind(il)) {
+                case layer_kind_t::ATTN:
+                    l.attn_q      = must_get(wctx, p + "attn_q.weight");
+                    l.attn_k      = must_get(wctx, p + "attn_k.weight");
+                    l.attn_v      = must_get(wctx, p + "attn_v.weight");
+                    l.attn_output = must_get(wctx, p + "attn_output.weight");
+                    break;
+                case layer_kind_t::SSM:
+                    l.ssm_in       = must_get(wctx, p + "ssm_in.weight");
+                    l.ssm_conv1d_w = must_get(wctx, p + "ssm_conv1d.weight");
+                    l.ssm_conv1d_b = must_get(wctx, p + "ssm_conv1d.bias");
+                    l.ssm_dt_b     = must_get(wctx, p + "ssm_dt.bias");
+                    l.ssm_a        = must_get(wctx, p + "ssm_a");
+                    l.ssm_d        = must_get(wctx, p + "ssm_d");
+                    l.ssm_out      = must_get(wctx, p + "ssm_out.weight");
+                    l.ssm_norm     = ggml_get_tensor(wctx, (p + "ssm_norm.weight").c_str()); // optional
+                    break;
+                case layer_kind_t::FFN:
+                    l.ffn_up   = must_get(wctx, p + "ffn_up.weight");
+                    l.ffn_down = must_get(wctx, p + "ffn_down.weight");
+                    break;
+            }
+        }
+        return m;
+    }
+
     for (int64_t il = 0; il < hp.n_layer; il++) {
         std::string p = "blk." + std::to_string(il) + ".";
         layer_weights & l = m.layers[il];
@@ -559,8 +639,13 @@ kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend) {
     kv.k.resize(hp.n_layer);
     kv.v.resize(hp.n_layer);
     for (int64_t il = 0; il < hp.n_layer; il++) {
-        kv.k[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, hp.n_head_kv, N_CTX_MAX);
-        kv.v[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, hp.n_head_kv, N_CTX_MAX);
+        // nemotron_h: most layers aren't attention at all -- size those slots minimally (1) rather
+        // than 0 (ggml doesn't allow zero-sized dims) since they're simply never written/read.
+        int64_t n_head_kv = hp.arch == arch_t::NEMOTRON_H
+                                 ? std::max<int64_t>(1, hp.n_head_kv_layer[il])
+                                 : hp.n_head_kv;
+        kv.k[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, n_head_kv, N_CTX_MAX);
+        kv.v[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, n_head_kv, N_CTX_MAX);
     }
 
     kv.buffer = ggml_backend_alloc_ctx_tensors(kv.ctx, backend);
@@ -570,6 +655,56 @@ kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend) {
         exit(1);
     }
     return kv;
+}
+
+// ---- nemotron_h's Mamba2 recurrent state (conv window + SSM state), single-sequence only ----
+
+ssm_state init_ssm_state(const hparams & hp, ggml_backend_t backend) {
+    ssm_state ss;
+    if (hp.arch != arch_t::NEMOTRON_H) return ss; // no-op for every other arch
+
+    const int64_t d_inner_xbc = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
+    const int64_t head_dim    = hp.ssm_d_inner / hp.ssm_n_head;
+
+    size_t buf_size = ggml_tensor_overhead() * (size_t)(hp.n_layer * 2 + 8);
+    struct ggml_init_params ip = { buf_size, nullptr, /*.no_alloc =*/ true };
+    ss.ctx = ggml_init(ip);
+
+    ss.ids = ggml_new_tensor_1d(ss.ctx, GGML_TYPE_I32, 1); // always {0}: single sequence, slot 0
+    ss.conv.resize(hp.n_layer, nullptr);
+    ss.state.resize(hp.n_layer, nullptr);
+    for (int64_t il = 0; il < hp.n_layer; il++) {
+        if (hp.layer_kind(il) != layer_kind_t::SSM) continue;
+        ss.conv[il]  = ggml_new_tensor_3d(ss.ctx, GGML_TYPE_F32, hp.ssm_d_conv - 1, d_inner_xbc, 1);
+        ss.state[il] = ggml_new_tensor_4d(ss.ctx, GGML_TYPE_F32, hp.ssm_d_state, head_dim, hp.ssm_n_head, 1);
+    }
+
+    ss.buffer = ggml_backend_alloc_ctx_tensors(ss.ctx, backend);
+    if (!ss.buffer) {
+        fprintf(stderr, "error: failed to allocate nemotron_h SSM state\n");
+        exit(1);
+    }
+    // conv/state start at zero (matches Mamba2's own zero-initial-state convention); ids is the
+    // constant {0} throughout this loader's lifetime (never batches multiple sequences). conv and
+    // state tensors have very different byte sizes (state is ~30x bigger here) -- size the zero
+    // buffer for the larger of the two, since it's reused (via ggml_nbytes-bounded copies) for both.
+    size_t conv_bytes  = (size_t)(hp.ssm_d_conv - 1) * d_inner_xbc * ggml_type_size(GGML_TYPE_F32);
+    size_t state_bytes = (size_t) hp.ssm_d_state * head_dim * hp.ssm_n_head * ggml_type_size(GGML_TYPE_F32);
+    std::vector<uint8_t> zero(std::max(conv_bytes, state_bytes), 0);
+    for (int64_t il = 0; il < hp.n_layer; il++) {
+        if (ss.conv[il])  ggml_backend_tensor_set(ss.conv[il],  zero.data(), 0, ggml_nbytes(ss.conv[il]));
+        if (ss.state[il]) ggml_backend_tensor_set(ss.state[il], zero.data(), 0, ggml_nbytes(ss.state[il]));
+    }
+    int32_t zero_id = 0;
+    ggml_backend_tensor_set(ss.ids, &zero_id, 0, sizeof(zero_id));
+    return ss;
+}
+
+void free_ssm_state(ssm_state & ss) {
+    if (ss.buffer) ggml_backend_buffer_free(ss.buffer);
+    if (ss.ctx)    ggml_free(ss.ctx);
+    ss.buffer = nullptr;
+    ss.ctx = nullptr;
 }
 
 // ---- graph construction: processes only the newest tokens, attending over the KV cache ----
@@ -591,8 +726,10 @@ static struct ggml_tensor * rms_norm_mul(struct ggml_context * ctx, struct ggml_
 // tensors ready for RoPE. Branches on hparams::qkv_fused: phi3 has one fused attn_qkv weight
 // (split via strided views, since mul_mat's single output can't be reshaped directly), qwen2 has
 // separate attn_q/k/v (+ bias) weights (each a fresh contiguous mul_mat output, so reshape works).
+// n_head_kv is passed explicitly rather than read from hp: nemotron_h's varies per layer (the
+// scalar hp.n_head_kv is meaningless for that arch -- see kv_cache's own per-layer sizing).
 static void build_qkv(struct ggml_context * ctx, const hparams & hp, const layer_weights & l,
-                       struct ggml_tensor * x, int64_t n_new, int64_t head_dim,
+                       struct ggml_tensor * x, int64_t n_new, int64_t head_dim, int64_t n_head_kv,
                        struct ggml_tensor ** out_Q, struct ggml_tensor ** out_K,
                        struct ggml_tensor ** out_V) {
     const size_t es = sizeof(float);
@@ -600,10 +737,10 @@ static void build_qkv(struct ggml_context * ctx, const hparams & hp, const layer
         struct ggml_tensor * qkv = ggml_mul_mat(ctx, l.attn_qkv, x); // [n_embd + 2*n_embd_kv, n_new]
         *out_Q = ggml_view_3d(ctx, qkv, head_dim, hp.n_head, n_new,
                                head_dim * es, qkv->nb[1], 0);
-        *out_K = ggml_view_3d(ctx, qkv, head_dim, hp.n_head_kv, n_new,
+        *out_K = ggml_view_3d(ctx, qkv, head_dim, n_head_kv, n_new,
                                head_dim * es, qkv->nb[1], hp.n_head * head_dim * es);
-        *out_V = ggml_view_3d(ctx, qkv, head_dim, hp.n_head_kv, n_new,
-                               head_dim * es, qkv->nb[1], (hp.n_head + hp.n_head_kv) * head_dim * es);
+        *out_V = ggml_view_3d(ctx, qkv, head_dim, n_head_kv, n_new,
+                               head_dim * es, qkv->nb[1], (hp.n_head + n_head_kv) * head_dim * es);
     } else {
         struct ggml_tensor * q = ggml_mul_mat(ctx, l.attn_q, x); // [n_head*head_dim, n_new]
         struct ggml_tensor * k = ggml_mul_mat(ctx, l.attn_k, x); // [n_head_kv*head_dim, n_new]
@@ -614,8 +751,8 @@ static void build_qkv(struct ggml_context * ctx, const hparams & hp, const layer
             v = ggml_add(ctx, v, l.attn_v_bias);
         }
         *out_Q = ggml_reshape_3d(ctx, q, head_dim, hp.n_head, n_new);
-        *out_K = ggml_reshape_3d(ctx, k, head_dim, hp.n_head_kv, n_new);
-        *out_V = ggml_reshape_3d(ctx, v, head_dim, hp.n_head_kv, n_new);
+        *out_K = ggml_reshape_3d(ctx, k, head_dim, n_head_kv, n_new);
+        *out_V = ggml_reshape_3d(ctx, v, head_dim, n_head_kv, n_new);
     }
 }
 
@@ -638,8 +775,97 @@ static struct ggml_tensor * build_ffn_act(struct ggml_context * ctx, const hpara
     return ggml_mul(ctx, ggml_silu(ctx, gate), up);
 }
 
+// nemotron_h's Mamba2 mixer. Recipe (op order, which tensor gets which transform) verified against
+// llama.cpp's own build_mamba2_layer, not guessed -- see layer_weights::ssm_* field comments and
+// the model.h ssm_state comment for what's cross-checked and why it matters (silent wrong-but-
+// plausible output on a mistake here, same failure mode as the earlier llama RoPE-type bug).
+static struct ggml_tensor * build_mamba2_layer(struct ggml_context * ctx, struct ggml_cgraph * gf,
+                                                 const hparams & hp, const layer_weights & l,
+                                                 const ssm_state & ss, int64_t il,
+                                                 struct ggml_tensor * x, int64_t n_new) {
+    const int64_t d_state  = hp.ssm_d_state;
+    const int64_t d_conv   = hp.ssm_d_conv;
+    const int64_t n_group  = hp.ssm_n_group;
+    const int64_t d_inner  = hp.ssm_d_inner;
+    const int64_t n_head   = hp.ssm_n_head;
+    const int64_t head_dim = d_inner / n_head;
+    const int64_t d_bc     = n_group * d_state;
+    const int64_t d_xbc    = d_inner + 2 * d_bc;
+    const size_t  es       = sizeof(float);
+
+    struct ggml_tensor * proj = ggml_mul_mat(ctx, l.ssm_in, x); // [d_inner + d_xbc + n_head, n_new]
+
+    // split order confirmed against upstream: z, then xBC, then dt (matches this checkpoint's own
+    // ssm_in output width exactly: d_inner + d_xbc + n_head)
+    struct ggml_tensor * z   = ggml_view_2d(ctx, proj, d_inner, n_new, proj->nb[1], 0);
+    struct ggml_tensor * xBC = ggml_view_2d(ctx, proj, d_xbc, n_new, proj->nb[1], d_inner * es);
+    struct ggml_tensor * dt  = ggml_view_2d(ctx, proj, n_head, n_new, proj->nb[1], (d_inner + d_xbc) * es);
+
+    // causal conv1d: concat this layer's rolling conv-state (previous d_conv-1 steps, zero-init)
+    // with the new tokens' xBC transposed to [time, channel], run ggml_ssm_conv, add bias, then
+    // silu the WHOLE xBC block (not just the x portion -- confirmed against upstream: x/B/C all
+    // get silu'd together before being split apart)
+    struct ggml_tensor * xBC_t   = ggml_cont(ctx, ggml_transpose(ctx, xBC)); // [n_new, d_xbc]
+    struct ggml_tensor * conv_in = ggml_concat(ctx, ss.conv[il], xBC_t, 0);  // [d_conv-1+n_new, d_xbc]
+    conv_in = ggml_reshape_3d(ctx, conv_in, d_conv - 1 + n_new, d_xbc, 1);
+
+    // the last (d_conv-1) columns of conv_in become the next step's rolling conv-state -- written
+    // into the graph now, same pattern as the KV-cache K/V writes elsewhere in this file (ggml's
+    // topological execution guarantees this cpy runs after everything that reads the OLD
+    // ss.conv[il]/ss.state[il], since those reads are upstream dependencies of this cpy's own input)
+    struct ggml_tensor * new_conv = ggml_view_3d(ctx, conv_in, d_conv - 1, d_xbc, 1,
+                                                  conv_in->nb[1], conv_in->nb[2], (size_t) n_new * conv_in->nb[0]);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, new_conv, ss.conv[il]));
+
+    struct ggml_tensor * xBC_conv = ggml_ssm_conv(ctx, conv_in, l.ssm_conv1d_w); // [d_xbc, n_new, 1]
+    xBC_conv = ggml_add(ctx, xBC_conv, l.ssm_conv1d_b);
+    xBC_conv = ggml_silu(ctx, xBC_conv);
+
+    struct ggml_tensor * xs = ggml_view_2d(ctx, xBC_conv, d_inner, n_new, xBC_conv->nb[1], 0);
+    struct ggml_tensor * B  = ggml_view_2d(ctx, xBC_conv, d_bc, n_new, xBC_conv->nb[1], d_inner * es);
+    struct ggml_tensor * C  = ggml_view_2d(ctx, xBC_conv, d_bc, n_new, xBC_conv->nb[1], (d_inner + d_bc) * es);
+
+    struct ggml_tensor * x4  = ggml_reshape_4d(ctx, ggml_cont(ctx, xs), head_dim, n_head, n_new, 1);
+    struct ggml_tensor * B4  = ggml_reshape_4d(ctx, ggml_cont(ctx, B), d_state, n_group, n_new, 1);
+    struct ggml_tensor * C4  = ggml_reshape_4d(ctx, ggml_cont(ctx, C), d_state, n_group, n_new, 1);
+    // dt bias-add produces a fresh contiguous tensor regardless of the view's own strides
+    struct ggml_tensor * dt3 = ggml_reshape_3d(ctx, ggml_add(ctx, dt, l.ssm_dt_b), n_head, n_new, 1);
+
+    // A used raw (no exp/negate) -- confirmed against upstream: this gguf's ssm_a is already
+    // stored in its final usable (negative, per-head decay) form
+    struct ggml_tensor * result = ggml_ssm_scan(ctx, ss.state[il], x4, dt3, l.ssm_a, B4, C4, ss.ids, 1);
+
+    // result packs y (nelements(x4)) followed by the new recurrent state
+    struct ggml_tensor * y = ggml_view_4d(ctx, result, head_dim, n_head, n_new, 1,
+                                           head_dim * es, head_dim * n_head * es,
+                                           head_dim * n_head * n_new * es, 0);
+    struct ggml_tensor * new_state = ggml_view_4d(ctx, result, d_state, head_dim, n_head, 1,
+                                                   d_state * es, d_state * head_dim * es,
+                                                   d_state * head_dim * n_head * es,
+                                                   ggml_nelements(x4) * es);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ss.state[il]));
+
+    // D-skip residual, then gate with z (silu(z)*y via a fused GLU op), then optional grouped
+    // RMSNorm -- this exact order (D-skip -> gate -> norm) confirmed against upstream; gating
+    // before the norm, not after, is the detail most likely to get silently swapped by guessing
+    struct ggml_tensor * d4 = ggml_reshape_4d(ctx, l.ssm_d, 1, n_head, 1, 1);
+    y = ggml_add(ctx, y, ggml_mul(ctx, x4, d4));
+    struct ggml_tensor * z4 = ggml_reshape_4d(ctx, ggml_cont(ctx, z), head_dim, n_head, n_new, 1);
+    y = ggml_swiglu_split(ctx, z4, y);
+
+    if (l.ssm_norm) {
+        struct ggml_tensor * y_grp = ggml_reshape_4d(ctx, y, d_inner / n_group, n_group, n_new, 1);
+        y_grp = ggml_mul(ctx, ggml_rms_norm(ctx, y_grp, hp.rms_eps), l.ssm_norm);
+        y = ggml_reshape_3d(ctx, y_grp, d_inner, n_new, 1);
+    } else {
+        y = ggml_reshape_3d(ctx, y, d_inner, n_new, 1);
+    }
+
+    return ggml_mul_mat(ctx, l.ssm_out, ggml_reshape_2d(ctx, y, d_inner, n_new)); // [n_embd, n_new]
+}
+
 static built_graph build_graph(struct ggml_context * ctx, const model & m, const hparams & hp,
-                                kv_cache & kv, int64_t n_past, int64_t n_new,
+                                kv_cache & kv, ssm_state * ss, int64_t n_past, int64_t n_new,
                                 bool use_flash_attn) {
     built_graph bg{};
     bg.gf = ggml_new_graph(ctx);
@@ -666,10 +892,33 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
 
         struct ggml_tensor * x = rms_norm_mul(ctx, cur, l.attn_norm, hp.rms_eps);
 
+        const layer_kind_t kind = hp.layer_kind(il);
+
+        if (kind == layer_kind_t::SSM) {
+            // nemotron_h: SSM-only block, no separate FFN in the same block (single mixer+residual)
+            cur = ggml_add(ctx, build_mamba2_layer(ctx, bg.gf, hp, l, *ss, il, x, n_new), residual);
+            continue;
+        }
+        if (kind == layer_kind_t::FFN) {
+            // nemotron_h: plain FFN-only block, ReLU^2 (not SwiGLU -- no gate tensor exists here),
+            // confirmed against upstream
+            struct ggml_tensor * up = ggml_mul_mat(ctx, l.ffn_up, x);
+            up = ggml_sqr(ctx, ggml_relu(ctx, up));
+            cur = ggml_add(ctx, ggml_mul_mat(ctx, l.ffn_down, up), residual);
+            continue;
+        }
+
+        // kind == ATTN: shared by every architecture (nemotron_h's attn-kind blocks included).
+        // n_head_kv comes from this layer's own KV-cache tensor shape rather than hp.n_head_kv --
+        // identical to the scalar for the 4 uniform-transformer archs, but nemotron_h's attention
+        // blocks vary per layer (see init_kv_cache), so the cache tensor is the actual source of
+        // truth for both.
+        const int64_t n_head_kv = kv.k[il]->ne[1];
+
         struct ggml_tensor * Qcur;
         struct ggml_tensor * Kcur;
         struct ggml_tensor * Vcur;
-        build_qkv(ctx, hp, l, x, n_new, head_dim, &Qcur, &Kcur, &Vcur);
+        build_qkv(ctx, hp, l, x, n_new, head_dim, n_head_kv, &Qcur, &Kcur, &Vcur);
 
         if (hp.has_qk_norm) {
             // per-head RMSNorm: rms_norm operates over ne0, which is head_dim here, so this
@@ -678,29 +927,35 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
             Kcur = rms_norm_mul(ctx, Kcur, l.attn_k_norm, hp.rms_eps);
         }
 
-        const int rope_mode = hp.rope_neox ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
-        Qcur = ggml_rope_ext(ctx, Qcur, bg.positions, m.rope_factors,
-                              (int) hp.n_rot, rope_mode, (int) hp.n_ctx_orig,
-                              hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
-                              rope_beta_fast, rope_beta_slow);
-        Kcur = ggml_rope_ext(ctx, Kcur, bg.positions, m.rope_factors,
-                              (int) hp.n_rot, rope_mode, (int) hp.n_ctx_orig,
-                              hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
-                              rope_beta_fast, rope_beta_slow);
+        if (!hp.no_rope) {
+            // nemotron_h's attention blocks apply NO positional encoding at all (verified against
+            // llama.cpp upstream: rope_type reports NONE for this arch family) -- skip entirely
+            // rather than applying rope with some default, which would silently scramble position
+            // information exactly like the earlier llama rope_neox bug did the other way around.
+            const int rope_mode = hp.rope_neox ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
+            Qcur = ggml_rope_ext(ctx, Qcur, bg.positions, m.rope_factors,
+                                  (int) hp.n_rot, rope_mode, (int) hp.n_ctx_orig,
+                                  hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
+                                  rope_beta_fast, rope_beta_slow);
+            Kcur = ggml_rope_ext(ctx, Kcur, bg.positions, m.rope_factors,
+                                  (int) hp.n_rot, rope_mode, (int) hp.n_ctx_orig,
+                                  hp.rope_freq_base, 1.0f, rope_ext_factor, hp.rope_attn_factor,
+                                  rope_beta_fast, rope_beta_slow);
+        }
 
         // write the newest K/V (post-RoPE for K) into the persistent cache at [n_past, n_past+n_new)
-        struct ggml_tensor * k_dst = ggml_view_3d(ctx, kv.k[il], head_dim, hp.n_head_kv, n_new,
+        struct ggml_tensor * k_dst = ggml_view_3d(ctx, kv.k[il], head_dim, n_head_kv, n_new,
                                                    kv.k[il]->nb[1], kv.k[il]->nb[2],
                                                    n_past * kv.k[il]->nb[2]);
-        struct ggml_tensor * v_dst = ggml_view_3d(ctx, kv.v[il], head_dim, hp.n_head_kv, n_new,
+        struct ggml_tensor * v_dst = ggml_view_3d(ctx, kv.v[il], head_dim, n_head_kv, n_new,
                                                    kv.v[il]->nb[1], kv.v[il]->nb[2],
                                                    n_past * kv.v[il]->nb[2]);
         ggml_build_forward_expand(bg.gf, ggml_cpy(ctx, Kcur, k_dst));
         ggml_build_forward_expand(bg.gf, ggml_cpy(ctx, Vcur, v_dst));
 
-        struct ggml_tensor * K_full = ggml_view_3d(ctx, kv.k[il], head_dim, hp.n_head_kv, n_kv,
+        struct ggml_tensor * K_full = ggml_view_3d(ctx, kv.k[il], head_dim, n_head_kv, n_kv,
                                                      kv.k[il]->nb[1], kv.k[il]->nb[2], 0);
-        struct ggml_tensor * V_full = ggml_view_3d(ctx, kv.v[il], head_dim, hp.n_head_kv, n_kv,
+        struct ggml_tensor * V_full = ggml_view_3d(ctx, kv.v[il], head_dim, n_head_kv, n_kv,
                                                      kv.v[il]->nb[1], kv.v[il]->nb[2], 0);
 
         struct ggml_tensor * Q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);   // [head_dim, n_new, n_head]
@@ -722,7 +977,7 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
             KQ = ggml_soft_max_ext(ctx, KQ, bg.mask, kq_scale, 0.0f);
 
             struct ggml_tensor * V_trans = ggml_cont_3d(ctx,
-                ggml_permute(ctx, V_full, 1, 2, 0, 3), n_kv, head_dim, hp.n_head_kv); // [n_kv, head_dim, n_head_kv]
+                ggml_permute(ctx, V_full, 1, 2, 0, 3), n_kv, head_dim, n_head_kv); // [n_kv, head_dim, n_head_kv]
 
             struct ggml_tensor * KQV = ggml_mul_mat(ctx, V_trans, KQ); // [head_dim, n_new, n_head]
             struct ggml_tensor * merged = ggml_permute(ctx, KQV, 0, 2, 1, 3); // [head_dim, n_head, n_new]
@@ -731,6 +986,11 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
 
         cur = ggml_mul_mat(ctx, l.attn_output, cur);
         cur = ggml_add(ctx, cur, residual);
+
+        if (hp.arch == arch_t::NEMOTRON_H) {
+            // attn-kind nemotron_h blocks have no separate FFN (single mixer per block) -- done.
+            continue;
+        }
 
         residual = cur;
         struct ggml_tensor * y = rms_norm_mul(ctx, cur, l.ffn_norm, hp.rms_eps);
@@ -763,7 +1023,8 @@ void free_decode_session(decode_session & ds) {
 
 std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & kv,
                                  decode_session & ds, ggml_backend_t backend, int64_t n_past,
-                                 const std::vector<int32_t> & new_tokens, int64_t n_vocab) {
+                                 const std::vector<int32_t> & new_tokens, int64_t n_vocab,
+                                 ssm_state * ss) {
     int64_t n_new = (int64_t) new_tokens.size();
     int64_t n_kv  = n_past + n_new;
 
@@ -774,7 +1035,7 @@ std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & 
     };
     struct ggml_context * gctx_build = ggml_init(gip);
 
-    built_graph bg = build_graph(gctx_build, m, hp, kv, n_past, n_new, ds.use_flash_attn);
+    built_graph bg = build_graph(gctx_build, m, hp, kv, ss, n_past, n_new, ds.use_flash_attn);
 
     // reused across calls: replans the (possibly differently-shaped) activation layout each
     // time rather than malloc/free-ing a fresh allocator every step
@@ -785,9 +1046,14 @@ std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & 
 
     ggml_backend_tensor_set(bg.tokens, new_tokens.data(), 0, n_new * sizeof(int32_t));
 
-    std::vector<int32_t> positions(n_new);
-    for (int64_t i = 0; i < n_new; i++) positions[i] = (int32_t)(n_past + i);
-    ggml_backend_tensor_set(bg.positions, positions.data(), 0, n_new * sizeof(int32_t));
+    // bg.positions only ever feeds ggml_rope_ext calls -- for hp.no_rope (nemotron_h), the graph
+    // never references it at all, so ggml_gallocr never allocates it a backend buffer, and setting
+    // it would abort in ggml_backend_tensor_set (an unallocated-tensor write, not a bounds issue).
+    if (!hp.no_rope) {
+        std::vector<int32_t> positions(n_new);
+        for (int64_t i = 0; i < n_new; i++) positions[i] = (int32_t)(n_past + i);
+        ggml_backend_tensor_set(bg.positions, positions.data(), 0, n_new * sizeof(int32_t));
+    }
 
     std::vector<float> mask((size_t)(n_kv * n_new));
     for (int64_t q = 0; q < n_new; q++) {

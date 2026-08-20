@@ -78,6 +78,7 @@ int cmd_chat(int argc, char ** argv) {
     const int32_t tok_eot = eot_it != vc.token_to_id.end() ? eot_it->second : -1;
 
     kv_cache kv = init_kv_cache(hp, backend);
+    ssm_state ss = init_ssm_state(hp, backend); // no-op struct for every arch except nemotron_h
     decode_session ds = init_decode_session(backend, flash_attn);
 
     fprintf(stderr, "%s loaded (%s, %lld layers, backend=%s). Type a message and press Enter "
@@ -111,7 +112,7 @@ int cmd_chat(int argc, char ** argv) {
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<float> logits = forward_step(m, hp, kv, ds, backend, n_past, pending, n_vocab);
+        std::vector<float> logits = forward_step(m, hp, kv, ds, backend, n_past, pending, n_vocab, &ss);
         n_past += (int64_t) pending.size();
         auto t1 = std::chrono::steady_clock::now();
         double prefill_s = std::chrono::duration<double>(t1 - t0).count();
@@ -129,14 +130,14 @@ int cmd_chat(int argc, char ** argv) {
             fflush(stdout);
             history.push_back(next);
 
-            std::vector<float> step_logits = forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab);
+            std::vector<float> step_logits = forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab, &ss);
             n_past += 1;
             n_reply++;
             next = sample(smp, step_logits, history);
         }
         // commit the terminator itself to the cache so history matches the chat template
         // exactly for the next turn's context
-        forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab);
+        forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab, &ss);
         n_past += 1;
         auto t3 = std::chrono::steady_clock::now();
         double decode_s = std::chrono::duration<double>(t3 - t2).count();
@@ -146,6 +147,7 @@ int cmd_chat(int argc, char ** argv) {
     }
 
     free_decode_session(ds);
+    free_ssm_state(ss);
     ggml_backend_buffer_free(kv.buffer);
     ggml_free(kv.ctx);
     ggml_backend_buffer_free(ws.buffer);

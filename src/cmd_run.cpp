@@ -95,6 +95,7 @@ int cmd_run(int argc, char ** argv) {
             (long long) hp.n_layer, (long long) hp.n_ff, (long long) hp.n_rot, (long long) n_vocab);
 
     kv_cache kv = init_kv_cache(hp, backend);
+    ssm_state ss = init_ssm_state(hp, backend); // no-op struct for every arch except nemotron_h
     decode_session ds = init_decode_session(backend, flash_attn);
     const int64_t head_dim = hp.n_embd_head;
     const double kv_cache_mib =
@@ -104,7 +105,7 @@ int cmd_run(int argc, char ** argv) {
 
     // prefill: process the whole prompt (BOS + encoded text) in one batch
     auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> logits = forward_step(m, hp, kv, ds, backend, 0, prompt_tokens, n_vocab);
+    std::vector<float> logits = forward_step(m, hp, kv, ds, backend, 0, prompt_tokens, n_vocab, &ss);
     auto t1 = std::chrono::steady_clock::now();
     double prefill_s = std::chrono::duration<double>(t1 - t0).count();
 
@@ -131,7 +132,7 @@ int cmd_run(int argc, char ** argv) {
         fputs(piece.c_str(), stdout);
         fflush(stdout);
 
-        std::vector<float> step_logits = forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab);
+        std::vector<float> step_logits = forward_step(m, hp, kv, ds, backend, n_past, { next }, n_vocab, &ss);
         n_past += 1;
         next = sample(smp, step_logits, all_tokens);
     }
@@ -144,6 +145,7 @@ int cmd_run(int argc, char ** argv) {
     fprintf(stderr, "\nfull output:\n%s\n", vc.detok(all_tokens).c_str());
 
     free_decode_session(ds);
+    free_ssm_state(ss);
     ggml_backend_buffer_free(kv.buffer);
     ggml_free(kv.ctx);
     ggml_backend_buffer_free(ws.buffer);

@@ -41,7 +41,16 @@ enum class arch_t {
     QWEN2,
     QWEN3,
     LLAMA,
+    NEMOTRON_H,
 };
+
+// nemotron_h only: which mixer a block uses. Derived from two per-layer gguf arrays
+// (attention.head_count_kv, feed_forward_length) exactly like llama.cpp's own hparams does --
+// n_head_kv==0 && n_ff==0 => SSM (Mamba2), n_head_kv!=0 => attention (no FFN in that block),
+// n_ff!=0 => plain FFN (no attn/ssm in that block). Every nemotron_h block is exactly ONE of
+// these (unlike a normal transformer block, which always combines attn+ffn) -- confirmed both
+// from this project's own tensor-presence inspection and against llama.cpp's upstream source.
+enum class layer_kind_t { ATTN, SSM, FFN };
 
 struct hparams {
     arch_t      arch;
@@ -74,6 +83,33 @@ struct hparams {
     bool has_qkv_bias; // qwen2: attn_q/k/v.bias present. phi3/qwen3: no bias.
     bool has_qk_norm;  // qwen3: attn_q_norm/attn_k_norm (RMSNorm per-head, before RoPE).
     bool ffn_fused;    // phi3: one ffn_up weight holding [gate;up]. qwen2/qwen3: separate ffn_gate/up.
+
+    // nemotron_h only, below. Its blocks aren't a uniform attn+ffn pair (see layer_kind_t) so it
+    // doesn't reuse the qkv_fused/ffn_fused/has_qk_norm flags above -- those stay at their default
+    // (false) for this arch and are simply unused by build_graph's nemotron_h branch.
+    bool no_rope = false; // true (nemotron_h only): attention layers apply NO positional encoding
+                           // at all -- confirmed both by this gguf having no rope.freq_base key
+                           // and against llama.cpp upstream (rope_type reports NONE for this arch
+                           // family in real bug reports). Getting this wrong the other way (adding
+                           // RoPE where the model expects none) would silently scramble attention
+                           // the same way a wrong rope_neox value did for llama.
+    std::vector<int64_t> n_head_kv_layer; // per-layer attention.head_count_kv, 0 where N/A
+    std::vector<int64_t> n_ff_layer;      // per-layer feed_forward_length, 0 where N/A
+    int64_t ssm_d_state = 0; // Mamba2 state size (nemotron_h.ssm.state_size)
+    int64_t ssm_d_conv  = 0; // causal conv1d kernel width (nemotron_h.ssm.conv_kernel)
+    int64_t ssm_n_group = 0; // B/C group count (nemotron_h.ssm.group_count)
+    int64_t ssm_d_inner = 0; // SSM's own working width (nemotron_h.ssm.inner_size)
+    int64_t ssm_n_head  = 0; // SSM head count == inner_size/head_dim (nemotron_h.ssm.time_step_rank,
+                              // despite that gguf key's Mamba-1-derived name -- confirmed via this
+                              // checkpoint's actual ssm_in output width: 2*d_inner + 2*n_group*
+                              // d_state + this value == ssm_in.weight's out-features exactly)
+
+    layer_kind_t layer_kind(int64_t il) const {
+        if (arch != arch_t::NEMOTRON_H) return layer_kind_t::ATTN; // unused by other archs' code path
+        if (n_ff_layer[il] != 0) return layer_kind_t::FFN;
+        if (n_head_kv_layer[il] != 0) return layer_kind_t::ATTN;
+        return layer_kind_t::SSM;
+    }
 
     int64_t bos_id;
     int64_t eos_id;
@@ -140,12 +176,28 @@ struct layer_weights {
     struct ggml_tensor * attn_output;
     struct ggml_tensor * ffn_norm;
 
-    // fused (phi3) vs separate (qwen2) FFN gate/up -- per hparams::ffn_fused
+    // fused (phi3) vs separate (qwen2) FFN gate/up -- per hparams::ffn_fused. nemotron_h's FFN-kind
+    // blocks set only ffn_up/ffn_down (ffn_gate stays null -- no gating, see layer_kind_t::FFN in
+    // build_graph: plain ReLU() rather than SwiGLU, verified against llama.cpp upstream).
     struct ggml_tensor * ffn_up_gate = nullptr; // packed [gate;up], phi3
     struct ggml_tensor * ffn_gate    = nullptr; // qwen2
     struct ggml_tensor * ffn_up      = nullptr; // qwen2
 
-    struct ggml_tensor * ffn_down;
+    struct ggml_tensor * ffn_down = nullptr;
+
+    // nemotron_h Mamba2 mixer -- only set when hparams::layer_kind(il) == SSM. Verified tensor
+    // roles and the exact op sequence they feed (ssm_in split order z/xBC/dt, conv-then-silu over
+    // the whole xBC chunk not just x, A used raw with no exp/negate, softplus happening inside
+    // ggml_ssm_scan rather than the graph, D-skip+gating before the groupnorm) against llama.cpp's
+    // own build_mamba2_layer, not guessed -- see build_graph's nemotron_h branch for the recipe.
+    struct ggml_tensor * ssm_in       = nullptr; // [n_embd, 2*d_inner + 2*n_group*d_state + n_head]
+    struct ggml_tensor * ssm_conv1d_w = nullptr; // [d_conv, d_inner + 2*n_group*d_state]
+    struct ggml_tensor * ssm_conv1d_b = nullptr;
+    struct ggml_tensor * ssm_dt_b     = nullptr; // [n_head] bias added to dt before ggml_ssm_scan
+    struct ggml_tensor * ssm_a        = nullptr; // [1, n_head] Mamba2 scalar-per-head decay, used raw
+    struct ggml_tensor * ssm_d        = nullptr; // [1, n_head] skip-connection scale
+    struct ggml_tensor * ssm_norm     = nullptr; // [d_inner/n_group, n_group] grouped RMSNorm weight
+    struct ggml_tensor * ssm_out      = nullptr; // [d_inner, n_embd]
 };
 
 struct model {
@@ -183,7 +235,10 @@ weights_store load_weights_filtered(const char * path, ggml_backend_t backend,
 // vulkan is requested but this build/device doesn't have it. n_threads only affects "cpu".
 ggml_backend_t init_backend(const std::string & name, int n_threads);
 
-// persistent KV cache: one F16 [head_dim, n_head_kv, N_CTX_MAX] tensor per layer, per K/V.
+// persistent KV cache: one F16 [head_dim, n_head_kv, N_CTX_MAX] tensor per layer, per K/V. For
+// nemotron_h (mixed layer kinds), every layer still gets a slot -- wasteful for its SSM/FFN-kind
+// layers (no attention there at all) but those slots are simply never written/read, and the waste
+// is negligible next to the model weights themselves; simpler than a sparse per-kind allocation.
 struct kv_cache {
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -192,6 +247,24 @@ struct kv_cache {
 };
 
 kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend);
+
+// nemotron_h's Mamba2 recurrent state -- NOT position-indexed like kv_cache. Each SSM-kind
+// layer gets a small fixed-size running accumulator (does not grow with context length) that
+// MUST be updated exactly once per token in strict sequence order -- unlike attention's KV range,
+// it can't be recomputed or randomly accessed. Sized for a single sequence (this loader never
+// batches multiple chat sessions together), so `ids` is always the constant 1-element {0} tensor
+// ggml_ssm_scan needs to select "sequence slot 0". Layers where layer_kind() != SSM get null
+// entries (never touched).
+struct ssm_state {
+    struct ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    struct ggml_tensor * ids = nullptr; // I32 [1], always {0}
+    std::vector<struct ggml_tensor *> conv;  // per layer: [d_conv-1, d_inner+2*n_group*d_state] or null
+    std::vector<struct ggml_tensor *> state; // per layer: [d_state, head_dim, n_head] or null
+};
+
+ssm_state init_ssm_state(const hparams & hp, ggml_backend_t backend);
+void free_ssm_state(ssm_state & ss);
 
 // Reusable scratch state for forward_step: a persistent graph-building buffer and a persistent
 // graph allocator, so a generation loop doesn't malloc/free them (and re-plan the activation
@@ -213,9 +286,12 @@ void free_decode_session(decode_session & ds);
 // Runs one forward pass for `new_tokens`, appending them to the KV cache at [n_past, n_past +
 // new_tokens.size()) and attending over the full [0, n_past + new_tokens.size()) cached range.
 // Returns the logits (size n_vocab) for the *last* new token only.
+// `ss` is only consulted for nemotron_h (must be non-null then); every other arch ignores it, so
+// existing call sites (run/bench on the 4 uniform-transformer archs) don't need to pass anything.
 std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & kv,
                                  decode_session & ds, ggml_backend_t backend, int64_t n_past,
-                                 const std::vector<int32_t> & new_tokens, int64_t n_vocab);
+                                 const std::vector<int32_t> & new_tokens, int64_t n_vocab,
+                                 ssm_state * ss = nullptr);
 
 int32_t argmax(const std::vector<float> & logits);
 
