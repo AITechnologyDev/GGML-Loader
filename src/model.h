@@ -113,6 +113,12 @@ struct hparams {
 
     int64_t bos_id;
     int64_t eos_id;
+
+    // detected from the gguf's own tokenizer.chat_template (substring-sniffed for "<think>" --
+    // no jinja engine here, see append_chat_turn's file-header comment) -- true for any reasoning
+    // model regardless of architecture (confirmed present on both qwen35 and nemotron_h's actual
+    // templates), not hardcoded per arch_t.
+    bool supports_thinking = false;
 };
 
 hparams load_hparams(const gguf_context * ctx);
@@ -151,8 +157,15 @@ void append_chat_turn(const hparams & hp, const vocab & vc, std::vector<int32_t>
                        const std::string & role, const std::string & text);
 
 // Appends the tokens that prompt the model to start its own turn (phi3: "<|assistant|>";
-// qwen2: "<|im_start|>assistant\n").
-void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<int32_t> & out);
+// qwen2: "<|im_start|>assistant\n"). For a reasoning model (hparams::supports_thinking) with
+// enable_thinking=false, also appends a forced-empty "<think>\n\n</think>\n\n" block right after,
+// suppressing reasoning -- matches how these models' own chat templates handle the disabled case
+// (confirmed against qwen35's and nemotron_h's actual jinja). enable_thinking=true (the default)
+// appends nothing extra: the model decides for itself whether to open a <think> block, same as
+// real chat templates leave it when thinking is allowed. No-op for non-reasoning models regardless
+// of the flag.
+void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<int32_t> & out,
+                               bool enable_thinking = true);
 
 // The token id that ends a turn in this model's chat template (phi3: "<|end|>"; qwen2: "<|im_end|>").
 int32_t turn_end_token(const hparams & hp, const vocab & vc);

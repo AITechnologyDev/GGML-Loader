@@ -20,7 +20,11 @@ static void print_usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s [model.gguf] [--system \"text\"] [--backend cpu|vulkan] [--flash-attn]\n"
         "           [--temp F] [--top-k N] [--top-p F] [--repeat-penalty F] [--repeat-last-n N] [--seed N]\n"
-        "  temp<=0 (default): greedy/deterministic, same as before these flags existed\n", argv0);
+        "           [--thinking | --no-thinking]\n"
+        "  temp<=0 (default): greedy/deterministic, same as before these flags existed\n"
+        "  --thinking/--no-thinking only matter for reasoning models (auto-detected from the\n"
+        "  model's own chat_template); default is --thinking (let the model decide whether to\n"
+        "  reason). --no-thinking forces an empty <think></think> block to suppress it.\n", argv0);
 }
 
 int cmd_chat(int argc, char ** argv) {
@@ -29,6 +33,7 @@ int cmd_chat(int argc, char ** argv) {
     std::string system_prompt;
     std::string backend_name = "cpu";
     bool flash_attn = false;
+    bool enable_thinking = true;
     sampler_params sp;
 
     for (int i = 1; i < argc; i++) {
@@ -39,6 +44,10 @@ int cmd_chat(int argc, char ** argv) {
             backend_name = argv[++i];
         } else if (a == "--flash-attn") {
             flash_attn = true;
+        } else if (a == "--thinking") {
+            enable_thinking = true;
+        } else if (a == "--no-thinking") {
+            enable_thinking = false;
         } else if (a == "--temp" && i + 1 < argc) {
             sp.temp = (float) atof(argv[++i]);
         } else if (a == "--top-k" && i + 1 < argc) {
@@ -81,9 +90,10 @@ int cmd_chat(int argc, char ** argv) {
     ssm_state ss = init_ssm_state(hp, backend); // no-op struct for every arch except nemotron_h
     decode_session ds = init_decode_session(backend, flash_attn);
 
-    fprintf(stderr, "%s loaded (%s, %lld layers, backend=%s). Type a message and press Enter "
+    fprintf(stderr, "%s loaded (%s, %lld layers, backend=%s%s). Type a message and press Enter "
                      "(Ctrl-D or 'exit' to quit).\n",
-            model_path.c_str(), hp.arch_name.c_str(), (long long) hp.n_layer, backend_name.c_str());
+            model_path.c_str(), hp.arch_name.c_str(), (long long) hp.n_layer, backend_name.c_str(),
+            hp.supports_thinking ? (enable_thinking ? ", thinking=on" : ", thinking=off") : "");
 
     std::vector<int32_t> pending = { (int32_t) hp.bos_id };
     if (!system_prompt.empty()) {
@@ -103,7 +113,7 @@ int cmd_chat(int argc, char ** argv) {
         if (line.empty()) continue;
 
         append_chat_turn(hp, vc, pending, "user", line);
-        append_generation_prompt(hp, vc, pending);
+        append_generation_prompt(hp, vc, pending, enable_thinking);
 
         if (n_past + (int64_t) pending.size() + max_reply_tokens > N_CTX_MAX) {
             fprintf(stderr, "\n[context window full (%lld tokens) -- restart to continue]\n",

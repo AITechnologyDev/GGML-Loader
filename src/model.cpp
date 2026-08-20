@@ -154,6 +154,10 @@ hparams load_hparams(const gguf_context * ctx) {
 
     h.bos_id = kv_int(ctx, "tokenizer.ggml.bos_token_id");
     h.eos_id = kv_int(ctx, "tokenizer.ggml.eos_token_id");
+
+    if (gguf_find_key(ctx, "tokenizer.chat_template") >= 0) {
+        h.supports_thinking = kv_string(ctx, "tokenizer.chat_template").find("<think>") != std::string::npos;
+    }
     return h;
 }
 
@@ -398,7 +402,17 @@ void append_chat_turn(const hparams & hp, const vocab & vc, std::vector<int32_t>
     }
 }
 
-void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<int32_t> & out) {
+// exact token if the vocab registers it (reasoning models virtually always do, for "<think>"/
+// "</think>"), otherwise falls back to plain BPE-encoded text -- correct either way, just
+// possibly non-canonical if a model happens not to register it as its own token.
+static void append_special_or_text(const vocab & vc, std::vector<int32_t> & out, const std::string & tag) {
+    auto it = vc.token_to_id.find(tag);
+    if (it != vc.token_to_id.end()) out.push_back(it->second);
+    else append_encoded(vc, out, tag);
+}
+
+void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<int32_t> & out,
+                               bool enable_thinking) {
     switch (hp.arch) {
         case arch_t::PHI3:
             out.push_back(vc.special("<|assistant|>"));
@@ -415,6 +429,14 @@ void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<
             out.push_back(vc.special("<|im_start|>"));
             append_encoded(vc, out, "assistant\n");
             break;
+    }
+    if (hp.supports_thinking && !enable_thinking) {
+        // forces the model to skip reasoning -- matches how these models' own templates handle
+        // enable_thinking=false (confirmed against qwen35's and nemotron_h's actual jinja)
+        append_special_or_text(vc, out, "<think>");
+        append_encoded(vc, out, "\n\n");
+        append_special_or_text(vc, out, "</think>");
+        append_encoded(vc, out, "\n\n");
     }
 }
 
